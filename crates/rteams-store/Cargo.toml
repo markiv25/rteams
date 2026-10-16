@@ -1,0 +1,15 @@
+[package]
+name = "rteams-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rteams-core = { path = "../rteams-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+fs2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

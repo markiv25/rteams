@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rteams-core",
+    "crates/rteams-store",
+    "crates/rteams-server",
+    "crates/rteams-tui",
+    "crates/rteams-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+fs2 = "0.4"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util"] }
+rteams-core = { path = "crates/rteams-core" }
+rteams-server = { path = "crates/rteams-server" }

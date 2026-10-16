@@ -1,0 +1,13 @@
+[package]
+name = "rteams-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rteams"
+path = "src/main.rs"
+
+[dependencies]
+rteams-server.workspace = true
+tokio.workspace = true
