@@ -77,3 +77,94 @@ fn retried_command_id_replays_for_policy_checked_tools_across_servers() {
     let plain = call(&b, "task_start", json!({ "task": id, "actor": "echo" })).unwrap_err();
     assert_eq!(plain["code"], "illegal_transition");
 }
+
+fn two_servers() -> (tempfile::TempDir, Server, Server) {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Server::with_store(FileStore::open(dir.path(), "t").unwrap());
+    let b = Server::with_store(FileStore::open(dir.path(), "t").unwrap());
+    call(
+        &a,
+        "team_create",
+        json!({ "name": "t", "actor": "team-lead", "members": [
+            { "name": "echo", "role": "developer" }, { "name": "pixel", "role": "reviewer" }] }),
+    )
+    .unwrap();
+    call(
+        &a,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "x", "owner": "echo" }),
+    )
+    .unwrap();
+    (dir, a, b)
+}
+
+#[test]
+fn policy_is_checked_against_latest_state_under_the_lock() {
+    let (_dir, a, b) = two_servers();
+    // `a` has seen echo own the task; `b` reassigns it before `a` acts on that belief.
+    call(&a, "task_list", json!({})).unwrap();
+    call(
+        &b,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "team-lead", "owner": "pixel" }),
+    )
+    .unwrap();
+
+    let err = call(&a, "task_start", json!({ "task": "1", "actor": "echo" })).unwrap_err();
+    assert_eq!(err["code"], "forbidden");
+    let ok = call(&a, "task_start", json!({ "task": "1", "actor": "pixel" })).unwrap();
+    assert_eq!(ok["task"]["status"], "in_progress");
+}
+
+#[test]
+fn only_one_of_two_racing_claims_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Server::with_store(FileStore::open(dir.path(), "t").unwrap());
+    let b = Server::with_store(FileStore::open(dir.path(), "t").unwrap());
+    call(
+        &a,
+        "team_create",
+        json!({ "name": "t", "actor": "team-lead", "members": [
+            { "name": "echo", "role": "developer" }, { "name": "pixel", "role": "reviewer" }] }),
+    )
+    .unwrap();
+    call(
+        &a,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "free" }),
+    )
+    .unwrap();
+    call(&b, "task_list", json!({})).unwrap();
+
+    call(
+        &a,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "echo", "owner": "echo" }),
+    )
+    .unwrap();
+    let err = call(
+        &b,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "pixel", "owner": "pixel" }),
+    )
+    .unwrap_err();
+    assert_eq!(err["code"], "forbidden");
+    let t = call(&b, "task_get", json!({ "task": "1" })).unwrap();
+    assert_eq!(t["task"]["owner"], "echo");
+}
+
+#[test]
+fn retry_after_losing_ownership_replays_instead_of_forbidden() {
+    let (_dir, a, b) = two_servers();
+    let args = json!({ "task": "1", "actor": "echo", "command_id": "start-1" });
+    let first = call(&a, "task_start", args.clone()).unwrap();
+    call(
+        &b,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "team-lead", "owner": "pixel" }),
+    )
+    .unwrap();
+    // echo is no longer the owner and the task already moved on; the retry still returns the original
+    let retry = call(&a, "task_start", args).unwrap();
+    assert_eq!(first["event_seq"], retry["event_seq"]);
+}

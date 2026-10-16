@@ -767,3 +767,50 @@ fn comments_require_a_roster_member() {
     let t = ok(&s, "task_get", json!({ "task": "1" }));
     assert_eq!(t["comments"], json!([]));
 }
+
+#[test]
+fn members_may_claim_unowned_tasks_but_not_steal_owned_ones() {
+    let s = Server::new();
+    team(&s);
+    ok(
+        &s,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "free" }),
+    );
+
+    // cannot claim on someone else's behalf
+    let (_, b) = call(
+        &s,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "echo", "owner": "pixel" }),
+    );
+    assert_eq!(b["code"], "forbidden");
+    // a non-member cannot claim at all (domain error wins)
+    let (_, b) = call(
+        &s,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "ghost", "owner": "ghost" }),
+    );
+    assert_eq!(b["code"], "unknown_member");
+
+    let t = ok(
+        &s,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "echo", "owner": "echo" }),
+    );
+    assert_eq!(t["task"]["owner"], "echo");
+
+    // now owned: pixel may not take it, the owner and a lead still may reassign
+    let (_, b) = call(
+        &s,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "pixel", "owner": "pixel" }),
+    );
+    assert_eq!(b["code"], "forbidden");
+    let t = ok(
+        &s,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "team-lead", "owner": "pixel" }),
+    );
+    assert_eq!(t["task"]["owner"], "pixel");
+}

@@ -57,6 +57,7 @@ impl From<StoreError> for ToolError {
     fn from(e: StoreError) -> Self {
         match e {
             StoreError::Core(e) => ToolError::Core(e),
+            StoreError::Forbidden(m) => ToolError::Forbidden(m),
             other => ToolError::Store(other.to_string()),
         }
     }
@@ -311,16 +312,11 @@ fn is_lead(state: &State, name: &str) -> bool {
 }
 
 /// Allow `actor` if they are `expected` (e.g. the task owner) or a lead.
-fn authorize(
-    state: &State,
-    actor: &str,
-    expected: Option<&str>,
-    who: &str,
-) -> Result<(), ToolError> {
+fn authorize(state: &State, actor: &str, expected: Option<&str>, who: &str) -> Result<(), String> {
     if expected == Some(actor) || is_lead(state, actor) {
         Ok(())
     } else {
-        Err(ToolError::Forbidden(format!("{actor} is not the {who}")))
+        Err(format!("{actor} is not the {who}"))
     }
 }
 
@@ -341,7 +337,26 @@ fn require_member(state: &State, actor: &str) -> Result<(), ToolError> {
     }
 }
 
-/// Run a review command: the state machine speaks first (dry-run decide), then policy, then commit.
+/// Run a command with a policy guard. The store runs the guard under its lock, after the
+/// state machine has accepted the command and before the event is appended, so check, decide
+/// and append are atomic across processes. A retried `command_id` returns the original result
+/// without consulting the guard.
+fn guarded(
+    store: &mut dyn Store,
+    cid: Option<&str>,
+    actor: &str,
+    task: &str,
+    cmd: Command,
+    guard: &dyn Fn(&State) -> Result<(), String>,
+) -> Result<Value, ToolError> {
+    let seq = store
+        .execute_guarded(actor, now_ms(), cid, cmd, guard)?
+        .event
+        .seq;
+    task_reply(store, seq, task)
+}
+
+/// Policy: `actor` must be whoever `expected` names on the task (or a lead).
 fn review(
     store: &mut dyn Store,
     cid: Option<&str>,
@@ -351,22 +366,11 @@ fn review(
     who: &str,
     expected: impl Fn(&Task) -> Option<String>,
 ) -> Result<Value, ToolError> {
-    // A retried command_id replays its original result: the dry run below would otherwise
-    // judge it against state the first attempt already changed.
-    if let Some(ev) = cid
-        .and_then(|id| store.replay(id).transpose())
-        .transpose()?
-    {
-        return task_reply(store, ev.seq, task);
-    }
-    let state = store.state()?;
-    let t = state
-        .task(task)
-        .ok_or_else(|| CoreError::TaskNotFound(task.to_string()))?;
-    state.decide(cmd.clone())?;
-    authorize(state, actor, expected(t).as_deref(), who)?;
-    let seq = exec(store, cid, actor, cmd)?.seq;
-    task_reply(store, seq, task)
+    let guard = |s: &State| match s.task(task) {
+        Some(t) => authorize(s, actor, expected(t).as_deref(), who),
+        None => Ok(()),
+    };
+    guarded(store, cid, actor, task, cmd, &guard)
 }
 
 /// Task lifecycle writes: only the task owner or a lead may mutate a task.
@@ -528,9 +532,17 @@ pub fn call(store: &mut dyn Store, name: &str, raw: Value) -> Result<Value, Tool
             let a: SetOwner = args(raw)?;
             let cmd = Command::AssignTask {
                 task: a.task.clone(),
-                owner: a.owner,
+                owner: a.owner.clone(),
             };
-            owner_or_lead(store, cid, &a.actor, &a.task, cmd)
+            // Owner or lead may reassign; anyone on the team may claim an unowned task for
+            // themselves (never steal an owned one).
+            let (actor, task, claim) = (a.actor.as_str(), a.task.as_str(), a.owner.as_deref());
+            let guard = |s: &State| match s.task(task) {
+                Some(t) if t.owner.is_none() && claim == Some(actor) => Ok(()),
+                Some(t) => authorize(s, actor, t.owner.as_deref(), "task owner"),
+                None => Ok(()),
+            };
+            guarded(store, cid, actor, task, cmd, &guard)
         }
         "task_add_comment" => {
             let a: Comment = args(raw)?;
@@ -572,22 +584,22 @@ pub fn call(store: &mut dyn Store, name: &str, raw: Value) -> Result<Value, Tool
         }
         "review_request" => {
             let a: ReviewRequest = args(raw)?;
-            if store
-                .state()?
-                .task(&a.task)
-                .is_some_and(|t| t.owner.as_deref() == Some(&a.reviewer))
-            {
-                return Err(ToolError::Forbidden(
-                    "the owner cannot review their own task".into(),
-                ));
-            }
             let cmd = Command::RequestReview {
                 task: a.task.clone(),
-                reviewer: a.reviewer,
+                reviewer: a.reviewer.clone(),
             };
-            review(store, cid, &a.actor, &a.task, cmd, "task owner", |t| {
-                t.owner.clone()
-            })
+            let (actor, task, reviewer) = (a.actor.as_str(), a.task.as_str(), a.reviewer.as_str());
+            let guard = |s: &State| match s.task(task) {
+                Some(t) => {
+                    authorize(s, actor, t.owner.as_deref(), "task owner")?;
+                    if t.owner.as_deref() == Some(reviewer) {
+                        return Err("the owner cannot review their own task".into());
+                    }
+                    Ok(())
+                }
+                None => Ok(()),
+            };
+            guarded(store, cid, actor, task, cmd, &guard)
         }
         "review_approve" => {
             let a: ReviewApprove = args(raw)?;
@@ -656,16 +668,15 @@ pub fn call(store: &mut dyn Store, name: &str, raw: Value) -> Result<Value, Tool
         "process_list" => Ok(json!({ "processes": process_list(store.state()?) })),
         "process_unregister" => {
             let a: ProcessUnregister = args(raw)?;
-            let state = store.state()?;
-            let owner = state
-                .processes
-                .iter()
-                .find(|p| p.pid == a.pid && p.running)
-                .map(|p| p.owner.clone());
-            if owner.is_some() {
-                authorize(state, &a.actor, owner.as_deref(), "process owner")?;
-            }
-            let seq = exec(store, cid, &a.actor, Command::StopProcess { pid: a.pid })?.seq;
+            let (actor, pid) = (a.actor.as_str(), a.pid);
+            let guard = |s: &State| match s.processes.iter().find(|p| p.pid == pid && p.running) {
+                Some(p) => authorize(s, actor, Some(p.owner.as_str()), "process owner"),
+                None => Ok(()),
+            };
+            let seq = store
+                .execute_guarded(actor, now_ms(), cid, Command::StopProcess { pid }, &guard)?
+                .event
+                .seq;
             Ok(json!({ "event_seq": seq, "processes": process_list(store.state()?) }))
         }
         other => Err(ToolError::UnknownTool(other.to_string())),

@@ -38,6 +38,9 @@ pub enum StoreError {
         line: u64,
         reason: String,
     },
+    /// A caller-supplied guard (authorization policy) refused the command under the lock.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("invalid team name {0:?}: use 1-64 chars of [A-Za-z0-9._-], not starting with '.'")]
     InvalidTeamName(String),
 }
@@ -52,15 +55,30 @@ pub struct Executed {
 /// What every backend gives callers: `execute` = decide, append, apply; reads see the full log.
 /// Reads take `&mut self` because a persistent store first catches up with other writers.
 pub trait Store {
-    /// Like `execute`, but a repeated `command_id` returns the original event instead of
-    /// appending a second one. `None` is a plain, non-idempotent execute.
+    /// The one write path. Under the store's lock, after catching up with other writers:
+    /// a repeated `command_id` returns the original event; otherwise the command is decided
+    /// (domain errors first), then `guard` sees the same state and may refuse it with a reason
+    /// (`StoreError::Forbidden`), and only then is the event appended. So check, decide and
+    /// append are atomic with respect to other processes.
+    fn execute_guarded(
+        &mut self,
+        actor: &str,
+        ts: i64,
+        command_id: Option<&str>,
+        cmd: Command,
+        guard: &dyn Fn(&State) -> Result<(), String>,
+    ) -> Result<Executed, StoreError>;
+
+    /// `execute_guarded` with no policy. `None` is a plain, non-idempotent execute.
     fn execute_with_id(
         &mut self,
         actor: &str,
         ts: i64,
         command_id: Option<&str>,
         cmd: Command,
-    ) -> Result<Executed, StoreError>;
+    ) -> Result<Executed, StoreError> {
+        self.execute_guarded(actor, ts, command_id, cmd, &|_| Ok(()))
+    }
 
     fn execute(&mut self, actor: &str, ts: i64, cmd: Command) -> Result<Event, StoreError> {
         Ok(self.execute_with_id(actor, ts, None, cmd)?.event)
@@ -89,12 +107,13 @@ impl MemoryStore {
 }
 
 impl Store for MemoryStore {
-    fn execute_with_id(
+    fn execute_guarded(
         &mut self,
         actor: &str,
         ts: i64,
         command_id: Option<&str>,
         cmd: Command,
+        guard: &dyn Fn(&State) -> Result<(), String>,
     ) -> Result<Executed, StoreError> {
         if let Some(&i) = command_id.and_then(|id| self.commands.get(id)) {
             return Ok(Executed {
@@ -102,6 +121,8 @@ impl Store for MemoryStore {
                 replayed: true,
             });
         }
+        self.mem.state().decide(cmd.clone())?;
+        guard(self.mem.state()).map_err(StoreError::Forbidden)?;
         let event = self.mem.execute(actor, ts, cmd)?.clone();
         if let Some(id) = command_id {
             self.commands

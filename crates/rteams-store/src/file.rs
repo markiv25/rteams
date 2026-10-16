@@ -107,6 +107,7 @@ impl FileStore {
         ts: i64,
         command_id: Option<&str>,
         cmd: Command,
+        guard: &dyn Fn(&State) -> Result<(), String>,
     ) -> Result<Executed, StoreError> {
         let lock_path = self.dir.join(".lock");
         self.lock_file.lock_exclusive().map_err(io(&lock_path))?;
@@ -123,6 +124,7 @@ impl FileStore {
         }
 
         let kind = self.state.decide(cmd)?;
+        guard(&self.state).map_err(StoreError::Forbidden)?;
         let event = Event {
             seq: self.events.len() as u64 + 1,
             ts,
@@ -262,14 +264,15 @@ impl FileStore {
 
 impl Store for FileStore {
     /// The id is persisted on the same log line as the event, so dedup and append are atomic.
-    fn execute_with_id(
+    fn execute_guarded(
         &mut self,
         actor: &str,
         ts: i64,
         command_id: Option<&str>,
         cmd: Command,
+        guard: &dyn Fn(&State) -> Result<(), String>,
     ) -> Result<Executed, StoreError> {
-        self.write(actor, ts, command_id, cmd)
+        self.write(actor, ts, command_id, cmd, guard)
     }
 
     fn replay(&mut self, command_id: &str) -> Result<Option<Event>, StoreError> {
