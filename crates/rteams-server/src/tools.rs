@@ -534,6 +534,7 @@ pub fn call(store: &mut dyn Store, name: &str, raw: Value) -> Result<Value, Tool
         }
         "task_add_comment" => {
             let a: Comment = args(raw)?;
+            require_member(store.state()?, &a.actor)?;
             let seq = exec(
                 store,
                 cid,

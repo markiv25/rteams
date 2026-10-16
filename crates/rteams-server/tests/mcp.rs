@@ -747,3 +747,23 @@ fn lead_may_mutate_any_task_and_reassign() {
         json!({ "task": "2", "actor": "team-lead" }),
     );
 }
+
+#[test]
+fn comments_require_a_roster_member() {
+    let s = Server::new();
+    team(&s);
+    ok(
+        &s,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "t", "owner": "echo" }),
+    );
+    let (e, b) = call(
+        &s,
+        "task_add_comment",
+        json!({ "task": "1", "actor": "ghost", "text": "hi" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "unknown_member");
+    let t = ok(&s, "task_get", json!({ "task": "1" }));
+    assert_eq!(t["comments"], json!([]));
+}
