@@ -220,6 +220,11 @@ impl MemberDialog {
         self.member = Some(name);
     }
 
+    #[cfg(test)]
+    pub fn show_edit_tab_for_tests(&mut self) {
+        self.tab = Tab::Edit;
+    }
+
     pub fn close(&mut self) {
         self.member = None;
     }

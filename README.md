@@ -1,5 +1,9 @@
 # rteams
 
+![rteams: a team of AI coding agents on one board](docs/images/banner.png)
+
+![The team page: chat on the left, the kanban board on the right](docs/images/team.png)
+
 A small team-coordination server for AI agents (tasks, review, messages, briefings), spoken over
 MCP on stdio. Each agent's Claude Code starts its own `rteams serve` process; all of them share
 one durable event log, so the team shares one board.
@@ -95,6 +99,16 @@ dark "Midnight Slate" look; no Electron, no provider zoo, no cloud.
 - **Task dialog:** edit title / description, actions for the current status, related tasks,
   task logs, workflow history, comments.
 - **Claude Logs** and **Processes** sections; OS notifications for reviews, messages, done.
+- **Member names and icons:** `+ Add` prefills the next free parody name (`chad-gpt`,
+  `sherlock-codes`, `yoda-lint`, `gandalf-the-grep`, `tony-stack`, ...); type over it to use
+  your own. Every avatar shows an icon: the parody's own, one derived from the name, or one you
+  pick in the member's Edit tab (`member_update` takes `icon`).
+
+| Graph view | Task dialog |
+|---|---|
+| ![Agents, their tasks and the lead in the graph view](docs/images/graph.png) | ![A task with its description, history and comments](docs/images/task.png) |
+| **Add a teammate** | **Pick a member icon** |
+| ![Add teammate with a prefilled parody name](docs/images/add-member.png) | ![The member Edit tab with the icon picker](docs/images/member-icons.png) |
 
 **How agents run (token-frugal by design).** Each agent is a one-shot `claude -p` run wired to
 `rteams serve` for the team. Nobody idles or polls: the GUI wakes an agent only when the log

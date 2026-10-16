@@ -719,12 +719,7 @@ impl App {
                     &self.i18n.t("rteams.toast.initialCommit"),
                 ),
                 Intent::AddMember => {
-                    let taken: Vec<String> = self
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.state().team.as_ref())
-                        .map(|t| t.members.iter().map(|m| m.name.clone()).collect())
-                        .unwrap_or_default();
+                    let taken = self.member_names();
                     self.add_member.open(taken.iter().map(String::as_str));
                 }
                 Intent::OpenMember(name) => self.member_dialog.open(name),
@@ -1538,6 +1533,17 @@ impl App {
     }
 }
 
+impl App {
+    /// Every member name, removed ones included (their names stay reserved).
+    fn member_names(&self) -> Vec<String> {
+        self.data
+            .as_ref()
+            .and_then(|d| d.state().team.as_ref())
+            .map(|t| t.members.iter().map(|m| m.name.clone()).collect())
+            .unwrap_or_default()
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -2133,7 +2139,7 @@ mod tests {
 
 /// Offscreen screenshots of every screen for UI review against the original's screenshots.
 /// `RTEAMS_SHOTS_HOME=<home with team "demo"> RTEAMS_SHOTS_OUT=<dir> cargo test -p rteams-gui
-/// screenshots -- --ignored`
+/// screenshots -- --ignored` (`RTEAMS_SHOTS_TEAM` picks another team)
 #[cfg(test)]
 mod screenshots {
     use super::*;
@@ -2144,11 +2150,12 @@ mod screenshots {
 
     fn shoot_sized(out: &Path, name: &str, size: egui::Vec2, setup: impl Fn(&mut App)) {
         let home = PathBuf::from(std::env::var("RTEAMS_SHOTS_HOME").expect("RTEAMS_SHOTS_HOME"));
+        let team = std::env::var("RTEAMS_SHOTS_TEAM").unwrap_or_else(|_| "demo".into());
         let mut h = egui_kittest::Harness::builder()
             .with_size(size)
             .with_accessibility_check(false)
             .wgpu()
-            .build_eframe(|cc| App::new(&cc.egui_ctx, home.clone(), "demo".into(), None));
+            .build_eframe(|cc| App::new(&cc.egui_ctx, home.clone(), team.clone(), None));
         setup(h.state_mut());
         h.run_steps(6);
         let img = h.render().expect("render");
@@ -2220,15 +2227,47 @@ mod screenshots {
                 a.open_tab(Tab::Team);
             },
         );
-        shoot(&out, "task_dialog", |a| a.task_dialog.open("11".into()));
+        // The team's own first task / first non-lead member, so any shots home works.
+        let first_task = |a: &mut App| {
+            a.try_open();
+            a.data
+                .as_ref()
+                .and_then(|d| d.state().tasks.first().map(|t| t.id.clone()))
+        };
+        let first_member = |a: &mut App| {
+            a.try_open();
+            a.data
+                .as_ref()
+                .and_then(|d| d.state().team.as_ref())
+                .and_then(|t| {
+                    t.members
+                        .iter()
+                        .find(|m| m.role != "lead")
+                        .map(|m| m.name.clone())
+                })
+        };
+        shoot(&out, "task_dialog", |a| {
+            let id = first_task(a).unwrap_or_else(|| "11".into());
+            a.task_dialog.open(id)
+        });
         shoot(&out, "chat_full", |a| {
             a.messages.open_chat(None);
             a.messages.toggle_full_screen_for_tests();
         });
         shoot(&out, "member_dialog", |a| {
-            a.member_dialog.open("alice".into())
+            let name = first_member(a).unwrap_or_else(|| "alice".into());
+            a.member_dialog.open(name)
+        });
+        shoot(&out, "member_edit", |a| {
+            let name = first_member(a).unwrap_or_else(|| "alice".into());
+            a.member_dialog.open(name);
+            a.member_dialog.show_edit_tab_for_tests();
         });
         shoot(&out, "create_task", |a| a.create_task.open(None));
-        shoot(&out, "add_member", |a| a.add_member.open(["lead"]));
+        shoot(&out, "add_member", |a| {
+            a.try_open();
+            let taken = a.member_names();
+            a.add_member.open(taken.iter().map(String::as_str))
+        });
     }
 }
