@@ -186,7 +186,7 @@ impl FileStore {
 
         self.offset += bytes.len() as u64;
         self.fold(line);
-        if let Some(id) = task_of(&self.events.last().expect("just folded").kind) {
+        for id in tasks_of(&self.events.last().expect("just folded").kind) {
             self.write_snapshot(&id);
         }
         Ok(Executed {
@@ -342,12 +342,14 @@ struct Snapshot<'a> {
     comments: Vec<&'a Message>,
 }
 
-fn task_of(kind: &EventKind) -> Option<String> {
+/// Tasks whose snapshot a (reaction-free) event may have changed.
+fn tasks_of(kind: &EventKind) -> Vec<String> {
     use EventKind::*;
     match kind {
         TaskCreated { task, .. }
         | TaskDependenciesSet { task, .. }
         | TaskAssigned { task, .. }
+        | TaskUpdated { task, .. }
         | TaskTransitioned { task, .. }
         | TaskBlocked { task, .. }
         | TaskUnblocked { task, .. }
@@ -355,12 +357,26 @@ fn task_of(kind: &EventKind) -> Option<String> {
         | TaskCommented { task, .. }
         | ReviewRequested { task, .. }
         | ReviewApproved { task, .. }
-        | ReviewChangesRequested { task, .. } => Some(task.clone()),
+        | ReviewChangesRequested { task, .. }
+        | TaskClarificationSet { task, .. }
+        | TaskFileAttached { task, .. }
+        | ReviewStarted { task } => vec![task.clone()],
+        TasksLinked { task, related, .. } => vec![task.clone(), related.clone()],
         TeamCreated { .. }
         | MemberAdded { .. }
         | MessageSent { .. }
+        | TeamConfigured { .. }
+        | MemberUpdated { .. }
+        | MemberRemoved { .. }
         | ProcessRegistered { .. }
-        | ProcessStopped { .. } => None,
+        | ProcessStopped { .. }
+        | ColumnOrderSet { .. }
+        | TeamDeleted { .. }
+        | MessageReacted { .. }
+        | ScheduleSet { .. }
+        | ScheduleRemoved { .. }
+        | PermissionRequested { .. }
+        | PermissionDecided { .. } => vec![],
     }
 }
 

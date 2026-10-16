@@ -107,7 +107,10 @@ fn member_briefing_is_bootstrap_context_not_the_queue() {
     let b = ok(&s, "member_briefing", json!({ "member": "echo" }));
     let mb = &b["member_briefing"];
     assert_eq!(mb["team"], "t");
-    assert_eq!(mb["you"], json!({ "name": "echo", "role": "developer" }));
+    assert_eq!(
+        mb["you"],
+        json!({ "name": "echo", "role": "developer", "prompt": null, "model": null, "removed": false, "runtime": null, "worktree": false })
+    );
     assert_eq!(mb["leads"], json!(["team-lead"]));
     assert_eq!(mb["roster"].as_array().unwrap().len(), 3);
     assert_eq!(mb["queue"], json!({ "actionable": 1, "awareness": 0 }));

@@ -255,6 +255,7 @@ pub fn lead_briefing(state: &State) -> LeadBriefing {
         .team
         .iter()
         .flat_map(|t| &t.members)
+        .filter(|m| !m.removed)
         .map(|m| {
             let mut l = MemberLoad {
                 member: m.name.clone(),
@@ -304,12 +305,22 @@ pub struct MemberBriefing {
     /// Sizes only; fetch `task_briefing` for the items themselves.
     pub queue: QueueSummary,
     pub processes: Vec<ProcessEntry>,
+    /// Working directory of the project, if the lead configured one.
+    #[serde(default)]
+    pub project_path: Option<String>,
+    /// Standing instructions from the lead for everyone.
+    #[serde(default)]
+    pub lead_prompt: Option<String>,
 }
 
 /// `None` when there is no team or `member` is not on it.
 pub fn member_briefing(state: &State, member: &str) -> Option<MemberBriefing> {
     let team = state.team.as_ref()?;
-    let you = team.members.iter().find(|m| m.name == member)?.clone();
+    let you = team
+        .members
+        .iter()
+        .find(|m| m.name == member && !m.removed)?
+        .clone();
     let q = briefing(state, member);
     Some(MemberBriefing {
         team: team.name.clone(),
@@ -317,15 +328,22 @@ pub fn member_briefing(state: &State, member: &str) -> Option<MemberBriefing> {
         leads: team
             .members
             .iter()
-            .filter(|m| m.role == "lead")
+            .filter(|m| !m.removed && m.role == "lead")
             .map(|m| m.name.clone())
             .collect(),
-        roster: team.members.clone(),
+        roster: team
+            .members
+            .iter()
+            .filter(|m| !m.removed)
+            .cloned()
+            .collect(),
         queue: QueueSummary {
             actionable: q.actionable.len(),
             awareness: q.awareness.len(),
         },
         processes: process_list(state),
+        project_path: team.project_path.clone(),
+        lead_prompt: team.lead_prompt.clone(),
     })
 }
 

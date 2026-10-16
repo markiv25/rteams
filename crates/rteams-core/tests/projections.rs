@@ -204,29 +204,37 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
     f.run(
         "lead",
         Command::SendMessage {
+            mode: None,
             to: Some("echo".into()),
             text: "direct to echo".into(),
+            from_team: None,
         },
     ); // seq 7
     f.run(
         "lead",
         Command::SendMessage {
+            mode: None,
             to: Some("ember".into()),
             text: "direct to ember".into(),
+            from_team: None,
         },
     );
     f.run(
         "lead",
         Command::SendMessage {
+            mode: None,
             to: None,
             text: "broadcast".into(),
+            from_team: None,
         },
     );
     f.run(
         "echo",
         Command::SendMessage {
+            mode: None,
             to: None,
             text: "my own broadcast".into(),
+            from_team: None,
         },
     );
     f.run(
@@ -273,8 +281,10 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
     f.run(
         "lead",
         Command::SendMessage {
+            mode: None,
             to: Some("echo".into()),
             text: "later".into(),
+            from_team: None,
         },
     );
     let later = inbox(f.store.state(), "echo", i.next_cursor);

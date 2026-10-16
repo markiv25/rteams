@@ -1,0 +1,39 @@
+# cargo-packager configuration: `cargo packager --release` (install with `cargo install cargo-packager --locked`).
+# Build the binaries first: `cargo build --release -p rteams-gui -p rteams-cli`.
+# Produces: macOS .app + .dmg, Linux AppImage + .deb, Windows NSIS installer (+ MSI via wix).
+# The GUI (rteams-gui) and the CLI (rteams) ship side by side in the same bundle.
+
+product-name = "rteams"
+version = "0.1.0"
+identifier = "com.rteams.app"
+description = "Rust port of Agent Teams: a desktop board and CLI for teams of coding agents."
+authors = ["rteams contributors"]
+license = "MIT"
+category = "DeveloperTool"
+out-dir = "dist"
+binaries-dir = "target/release"
+# Placeholder icon (packaging/icons/icon.png); replace with real artwork before a public release.
+icons = ["packaging/icons/icon.png"]
+
+# `main = true` is the executable the .app / installer launches.
+binaries = [
+  { path = "rteams-gui", main = true },
+  { path = "rteams" },
+]
+
+# Per-OS format selection happens on the command line (`--formats`), see .github/workflows/release.yml.
+formats = ["all"]
+
+[dmg]
+window-size = { width = 660, height = 400 }
+
+[deb]
+depends = ["libxkbcommon0", "libgl1", "libwayland-client0", "libxcb1"]
+
+[nsis]
+# Per-user install, no admin prompt.
+install-mode = "currentUser"
+
+# Updates: this fork has no release channel yet, so the app never self-updates. The in-app update
+# banner only reads the feed configured in config.json (`general.update_feed_url`) and opens the
+# release page in the browser. No `[updater]` section is configured on purpose.

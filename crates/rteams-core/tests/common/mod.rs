@@ -25,6 +25,7 @@ impl Fixture {
                 Command::AddMember {
                     name: n.into(),
                     role: r.into(),
+                    runtime: None,
                 },
             );
         }

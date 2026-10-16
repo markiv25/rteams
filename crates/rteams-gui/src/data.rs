@@ -5,11 +5,11 @@
 //! frame sees one consistent view. Everything returned is a plain, owned, renderable struct.
 //!
 //! Stable signatures (echo/scout rely on them): `open`, `refresh`, `state`.
-//! Added: `seq`, `team_name`, `snapshot`, `task_detail`, `activity`.
+//! Added: `seq`, `team_name`, `task_detail`.
 
 use std::path::PathBuf;
 
-use rteams_core::{kanban, Card, Event, EventKind, Scope, State, Status};
+use rteams_core::{Event, EventKind, Scope, State, Status};
 use rteams_store::FileStore;
 
 /// Read-only view of one team's log. Never appends.
@@ -48,9 +48,14 @@ impl Data {
         self.store.loaded_events().last().map_or(0, |e| e.seq)
     }
 
+    /// Every event loaded as of the last `refresh`, oldest first.
+    pub fn events(&self) -> &[Event] {
+        self.store.loaded_events()
+    }
+
     /// Current state as of the last `refresh`.
-    pub fn state(&mut self) -> Result<&State, String> {
-        Ok(self.store.loaded_state())
+    pub fn state(&self) -> &State {
+        self.store.loaded_state()
     }
 
     pub fn team_name(&self) -> Option<String> {
@@ -59,45 +64,6 @@ impl Data {
             .team
             .as_ref()
             .map(|t| t.name.clone())
-    }
-
-    /// Board with everything a card needs to render, plus the cursor it was built at.
-    pub fn snapshot(&self) -> BoardSnapshot {
-        let state = self.store.loaded_state();
-        let board = kanban(state);
-        let col = |name: &'static str, cards: Vec<Card>| Column {
-            name,
-            cards: cards
-                .into_iter()
-                .map(|c| CardView {
-                    waiting_on: state
-                        .task(&c.id)
-                        .map(|t| {
-                            state
-                                .unmet_dependencies(t)
-                                .into_iter()
-                                .map(String::from)
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    id: c.id,
-                    subject: c.subject,
-                    owner: c.owner,
-                    status: c.status,
-                })
-                .collect(),
-        };
-        BoardSnapshot {
-            seq: self.seq(),
-            team: self.team_name(),
-            columns: vec![
-                col("To do", board.todo),
-                col("In progress", board.in_progress),
-                col("Review", board.review),
-                col("Approved", board.approved),
-                col("Done", board.done),
-            ],
-        }
     }
 
     /// Everything about one task, or `None` if unknown (archived tasks are still found).
@@ -142,48 +108,6 @@ impl Data {
             history,
         })
     }
-
-    /// Newest-first activity feed, at most `limit` items.
-    pub fn activity(&self, limit: usize) -> Vec<ActivityItem> {
-        self.store
-            .loaded_events()
-            .iter()
-            .rev()
-            .take(limit)
-            .map(|e| ActivityItem {
-                seq: e.seq,
-                ts: e.ts,
-                actor: e.actor.clone(),
-                task: event_task(&e.kind).map(String::from),
-                summary: summarize(&e.kind),
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CardView {
-    pub id: String,
-    pub subject: String,
-    pub owner: Option<String>,
-    pub status: Status,
-    /// Unmet dependencies (not done yet), for a "waiting on" badge.
-    pub waiting_on: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Column {
-    pub name: &'static str,
-    pub cards: Vec<CardView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoardSnapshot {
-    /// Log position this snapshot was built at.
-    pub seq: u64,
-    pub team: Option<String>,
-    /// Always five, in order: To do, In progress, Review, Approved, Done.
-    pub columns: Vec<Column>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,15 +147,6 @@ pub struct TaskDetail {
     pub history: Vec<HistoryItem>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivityItem {
-    pub seq: u64,
-    pub ts: i64,
-    pub actor: String,
-    pub task: Option<String>,
-    pub summary: String,
-}
-
 fn history_item(e: &Event) -> HistoryItem {
     HistoryItem {
         seq: e.seq,
@@ -248,6 +163,7 @@ fn event_task(k: &EventKind) -> Option<&str> {
         TaskCreated { task, .. }
         | TaskDependenciesSet { task, .. }
         | TaskAssigned { task, .. }
+        | TaskUpdated { task, .. }
         | TaskTransitioned { task, .. }
         | TaskBlocked { task, .. }
         | TaskUnblocked { task, .. }
@@ -255,12 +171,26 @@ fn event_task(k: &EventKind) -> Option<&str> {
         | TaskCommented { task, .. }
         | ReviewRequested { task, .. }
         | ReviewApproved { task, .. }
-        | ReviewChangesRequested { task, .. } => Some(task),
+        | ReviewChangesRequested { task, .. }
+        | TaskClarificationSet { task, .. }
+        | TaskFileAttached { task, .. }
+        | TasksLinked { task, .. }
+        | ReviewStarted { task } => Some(task),
         TeamCreated { .. }
         | MemberAdded { .. }
         | MessageSent { .. }
+        | TeamConfigured { .. }
+        | MemberUpdated { .. }
+        | MemberRemoved { .. }
         | ProcessRegistered { .. }
-        | ProcessStopped { .. } => None,
+        | ProcessStopped { .. }
+        | ColumnOrderSet { .. }
+        | TeamDeleted { .. }
+        | MessageReacted { .. }
+        | ScheduleSet { .. }
+        | ScheduleRemoved { .. }
+        | PermissionRequested { .. }
+        | PermissionDecided { .. } => None,
     }
 }
 
@@ -281,7 +211,17 @@ fn summarize(k: &EventKind) -> String {
     use EventKind::*;
     match k {
         TeamCreated { name } => format!("created team {name}"),
-        MemberAdded { name, role } => format!("added {name} ({role})"),
+        MemberAdded { name, role, .. } => format!("added {name} ({role})"),
+        TeamConfigured { .. } => "configured the team".to_string(),
+        MemberUpdated { name, .. } => format!("updated {name}"),
+        MemberRemoved {
+            name,
+            removed: true,
+        } => format!("removed {name}"),
+        MemberRemoved {
+            name,
+            removed: false,
+        } => format!("restored {name}"),
         TaskCreated { task, subject, .. } => format!("created {task}: {subject}"),
         TaskDependenciesSet { task, blocked_by } if blocked_by.is_empty() => {
             format!("cleared dependencies of {task}")
@@ -289,6 +229,7 @@ fn summarize(k: &EventKind) -> String {
         TaskDependenciesSet { task, blocked_by } => {
             format!("{task} now depends on {}", blocked_by.join(", "))
         }
+        TaskUpdated { task, .. } => format!("edited {task}"),
         TaskAssigned { task, owner } => match owner {
             Some(o) => format!("assigned {task} to {o}"),
             None => format!("unassigned {task}"),
@@ -312,10 +253,35 @@ fn summarize(k: &EventKind) -> String {
         ReviewChangesRequested { task, comment } => {
             format!("requested changes on {task}: {}", clip(comment))
         }
-        MessageSent { to: Some(to), text } => format!("messaged {to}: {}", clip(text)),
-        MessageSent { to: None, text } => format!("broadcast: {}", clip(text)),
+        MessageSent {
+            to: Some(to), text, ..
+        } => format!("messaged {to}: {}", clip(text)),
+        MessageSent { to: None, text, .. } => format!("broadcast: {}", clip(text)),
         ProcessRegistered { pid, label, .. } => format!("started process {label} (pid {pid})"),
         ProcessStopped { pid } => format!("stopped process (pid {pid})"),
+        TaskClarificationSet {
+            task,
+            question: Some(q),
+        } => format!("asked on {task}: {}", clip(q)),
+        TaskClarificationSet { task, .. } => format!("cleared the question on {task}"),
+        TaskFileAttached { task, name, .. } => format!("attached {name} to {task}"),
+        TasksLinked {
+            task,
+            related,
+            linked: true,
+        } => format!("linked {task} with {related}"),
+        TasksLinked { task, related, .. } => format!("unlinked {task} from {related}"),
+        ReviewStarted { task } => format!("started reviewing {task}"),
+        ColumnOrderSet { column, .. } => format!("reordered the {column} column"),
+        TeamDeleted { deleted: true } => "deleted the team".to_string(),
+        TeamDeleted { .. } => "restored the team".to_string(),
+        MessageReacted { emoji, .. } => format!("reacted {emoji}"),
+        ScheduleSet { schedule } => format!("scheduled {} for {}", schedule.id, schedule.member),
+        ScheduleRemoved { id } => format!("removed schedule {id}"),
+        PermissionRequested { member, tool, .. } => format!("{member} requests {tool}"),
+        PermissionDecided { id, allow, .. } => {
+            format!("{} request {id}", if *allow { "allowed" } else { "denied" })
+        }
     }
 }
 
@@ -379,7 +345,7 @@ mod tests {
         assert_eq!(d.seq(), seq, "reads only move on refresh");
         assert!(d.refresh().unwrap());
         assert!(d.seq() > seq);
-        assert_eq!(d.snapshot().columns[0].cards.len(), 1);
+        assert_eq!(d.state().tasks.len(), 1);
         assert!(!d.refresh().unwrap());
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -395,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_detail_and_activity_render_the_log() {
+    fn task_detail_renders_the_log() {
         let home = tmp("views");
         let mut w = create_team(&home);
         w.execute(
@@ -404,6 +370,7 @@ mod tests {
             Command::AddMember {
                 name: "vector".into(),
                 role: "dev".into(),
+                runtime: None,
             },
         )
         .unwrap();
@@ -430,15 +397,6 @@ mod tests {
         let mut d = Data::open(home.clone(), "t").unwrap();
         d.refresh().unwrap();
 
-        let snap = d.snapshot();
-        assert_eq!(snap.team.as_deref(), Some("t"));
-        assert_eq!(snap.seq, d.seq());
-        assert_eq!(snap.columns.len(), 5);
-        assert_eq!(snap.columns[0].cards[0].id, "T2");
-        assert_eq!(snap.columns[0].cards[0].waiting_on, vec!["T1"]);
-        assert_eq!(snap.columns[1].cards[0].id, "T1");
-        assert_eq!(snap.columns[1].cards[0].owner.as_deref(), Some("vector"));
-
         let t1 = d.task_detail("T1").unwrap();
         assert_eq!(t1.description, "desc T1");
         assert_eq!(t1.blocks, vec!["T2"]);
@@ -449,12 +407,6 @@ mod tests {
         assert_eq!(t2.waiting_on, vec!["T1"]);
         assert!(d.task_detail("nope").is_none());
 
-        let a = d.activity(2);
-        assert_eq!(a.len(), 2);
-        assert!(a[0].seq > a[1].seq, "newest first");
-        assert_eq!(a[0].task.as_deref(), Some("T1"));
-        assert!(a[0].summary.contains("in progress"));
-        assert!(a[1].summary.ends_with('…'), "multi-line comment is clipped");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

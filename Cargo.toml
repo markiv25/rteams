@@ -7,6 +7,7 @@ members = [
     "crates/rteams-tui",
     "crates/rteams-cli",
     "crates/rteams-gui",
+    "crates/rteams-services",
 ]
 
 [workspace.package]
@@ -24,3 +25,4 @@ tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util"] }
 rteams-core = { path = "crates/rteams-core" }
 rteams-store = { path = "crates/rteams-store" }
 rteams-server = { path = "crates/rteams-server" }
+rteams-services = { path = "crates/rteams-services" }

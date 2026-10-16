@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::command::Command;
-use crate::domain::{Member, Message, ProcessEntry, Scope, Task, Team};
+use crate::domain::{
+    Attachment, Member, Message, PermissionRequest, ProcessEntry, Reaction, Scope, Task, Team,
+};
 use crate::error::CoreError;
 use crate::event::{Event, EventKind};
 use crate::lifecycle::Status;
@@ -17,6 +19,8 @@ pub struct State {
     pub messages: Vec<Message>,
     /// Registration order.
     pub processes: Vec<ProcessEntry>,
+    /// Tool-approval requests, in request order.
+    pub permissions: Vec<PermissionRequest>,
 }
 
 impl State {
@@ -82,7 +86,22 @@ impl State {
     pub fn is_member(&self, name: &str) -> bool {
         self.team
             .as_ref()
+            .is_some_and(|t| t.members.iter().any(|m| m.name == name && !m.removed))
+    }
+
+    /// Includes removed members (their names stay reserved).
+    fn has_member_record(&self, name: &str) -> bool {
+        self.team
+            .as_ref()
             .is_some_and(|t| t.members.iter().any(|m| m.name == name))
+    }
+
+    fn member_mut(&mut self, name: &str) -> Option<&mut Member> {
+        self.team
+            .as_mut()?
+            .members
+            .iter_mut()
+            .find(|m| m.name == name)
     }
 
     /// Fold one event. Lenient on purpose: events were validated by `decide` when appended,
@@ -95,14 +114,77 @@ impl State {
                 self.team = Some(Team {
                     name: name.clone(),
                     members: vec![],
+                    project_path: None,
+                    lead_prompt: None,
+                    deleted: false,
+                    column_order: Default::default(),
+                    schedules: vec![],
                 });
             }
-            MemberAdded { name, role } => {
+            MemberAdded {
+                name,
+                role,
+                runtime,
+            } => {
                 if let Some(t) = &mut self.team {
                     t.members.push(Member {
                         name: name.clone(),
                         role: role.clone(),
+                        prompt: None,
+                        model: None,
+                        removed: false,
+                        runtime: runtime.clone(),
+                        worktree: false,
+                        icon: None,
                     });
+                }
+            }
+            TeamConfigured {
+                project_path,
+                lead_prompt,
+            } => {
+                if let Some(t) = &mut self.team {
+                    if let Some(p) = project_path {
+                        t.project_path = Some(p.clone());
+                    }
+                    if let Some(p) = lead_prompt {
+                        t.lead_prompt = Some(p.clone());
+                    }
+                }
+            }
+            MemberUpdated {
+                name,
+                role,
+                prompt,
+                model,
+                runtime,
+                worktree,
+                icon,
+            } => {
+                if let Some(m) = self.member_mut(name) {
+                    if let Some(i) = icon {
+                        m.icon = (!i.trim().is_empty()).then(|| i.trim().to_string());
+                    }
+                    if let Some(r) = runtime {
+                        m.runtime = Some(r.clone());
+                    }
+                    if let Some(w) = worktree {
+                        m.worktree = *w;
+                    }
+                    if let Some(r) = role {
+                        m.role = r.clone();
+                    }
+                    if let Some(p) = prompt {
+                        m.prompt = Some(p.clone());
+                    }
+                    if let Some(x) = model {
+                        m.model = Some(x.clone());
+                    }
+                }
+            }
+            MemberRemoved { name, removed } => {
+                if let Some(m) = self.member_mut(name) {
+                    m.removed = *removed;
                 }
             }
             TaskCreated {
@@ -125,11 +207,29 @@ impl State {
                     blocked_reason: None,
                     archived: false,
                     created_seq: seq,
+                    clarification: None,
+                    attachments: vec![],
+                    related: vec![],
+                    review_started: false,
                 });
             }
             TaskDependenciesSet { task, blocked_by } => {
                 if let Some(t) = self.task_mut(task) {
                     t.blocked_by = blocked_by.clone();
+                }
+            }
+            TaskUpdated {
+                task,
+                subject,
+                description,
+            } => {
+                if let Some(t) = self.task_mut(task) {
+                    if let Some(s) = subject {
+                        t.subject = s.clone();
+                    }
+                    if let Some(d) = description {
+                        t.description = d.clone();
+                    }
                 }
             }
             TaskAssigned { task, owner } => {
@@ -140,6 +240,7 @@ impl State {
             TaskTransitioned { task, to, .. } => {
                 if let Some(t) = self.task_mut(task) {
                     t.status = *to;
+                    t.review_started = false;
                 }
             }
             TaskBlocked { task, reason, from } => {
@@ -168,11 +269,13 @@ impl State {
                 if let Some(t) = self.task_mut(task) {
                     t.status = Status::Review;
                     t.reviewer = Some(reviewer.clone());
+                    t.review_started = false;
                 }
             }
             ReviewApproved { task, note } => {
                 if let Some(t) = self.task_mut(task) {
                     t.status = Status::Approved;
+                    t.review_started = false;
                 }
                 if let Some(note) = note {
                     self.push_message(seq, ts, e, Scope::Task { task: task.clone() }, note.clone());
@@ -181,6 +284,7 @@ impl State {
             ReviewChangesRequested { task, comment } => {
                 if let Some(t) = self.task_mut(task) {
                     t.status = Status::NeedsFix;
+                    t.review_started = false;
                 }
                 self.push_message(
                     seq,
@@ -190,12 +294,21 @@ impl State {
                     comment.clone(),
                 );
             }
-            MessageSent { to, text } => {
+            MessageSent {
+                to,
+                text,
+                mode,
+                from_team,
+            } => {
                 let scope = match to {
                     Some(to) => Scope::Direct { to: to.clone() },
                     None => Scope::Broadcast,
                 };
                 self.push_message(seq, ts, e, scope, text.clone());
+                if let Some(m) = self.messages.last_mut() {
+                    m.mode = mode.clone();
+                    m.from_team = from_team.clone();
+                }
             }
             ProcessRegistered {
                 pid,
@@ -220,6 +333,93 @@ impl State {
                     p.running = false;
                 }
             }
+            TaskClarificationSet { task, question } => {
+                if let Some(t) = self.task_mut(task) {
+                    t.clarification = question.clone();
+                }
+            }
+            TaskFileAttached { task, name, path } => {
+                if let Some(t) = self.task_mut(task) {
+                    t.attachments.push(Attachment {
+                        name: name.clone(),
+                        path: path.clone(),
+                    });
+                }
+            }
+            TasksLinked {
+                task,
+                related,
+                linked,
+            } => {
+                for (a, b) in [(task, related), (related, task)] {
+                    if let Some(t) = self.task_mut(a) {
+                        t.related.retain(|r| r != b);
+                        if *linked {
+                            t.related.push(b.clone());
+                        }
+                    }
+                }
+            }
+            ReviewStarted { task } => {
+                if let Some(t) = self.task_mut(task) {
+                    t.review_started = true;
+                }
+            }
+            ColumnOrderSet { column, order } => {
+                if let Some(t) = &mut self.team {
+                    t.column_order.insert(column.clone(), order.clone());
+                }
+            }
+            TeamDeleted { deleted } => {
+                if let Some(t) = &mut self.team {
+                    t.deleted = *deleted;
+                }
+            }
+            MessageReacted { message_seq, emoji } => {
+                if let Some(m) = self.messages.iter_mut().find(|m| m.seq == *message_seq) {
+                    let before = m.reactions.len();
+                    m.reactions
+                        .retain(|r| !(r.from == e.actor && r.emoji == *emoji));
+                    if m.reactions.len() == before {
+                        m.reactions.push(Reaction {
+                            from: e.actor.clone(),
+                            emoji: emoji.clone(),
+                        });
+                    }
+                }
+            }
+            ScheduleSet { schedule } => {
+                if let Some(t) = &mut self.team {
+                    match t.schedules.iter_mut().find(|s| s.id == schedule.id) {
+                        Some(s) => *s = schedule.clone(),
+                        None => t.schedules.push(schedule.clone()),
+                    }
+                }
+            }
+            ScheduleRemoved { id } => {
+                if let Some(t) = &mut self.team {
+                    t.schedules.retain(|s| s.id != *id);
+                }
+            }
+            PermissionRequested {
+                id,
+                member,
+                tool,
+                input,
+            } => self.permissions.push(PermissionRequest {
+                id: id.clone(),
+                member: member.clone(),
+                tool: tool.clone(),
+                input: input.clone(),
+                decided: None,
+                note: None,
+            }),
+            PermissionDecided { id, allow, note } => {
+                if let Some(p) = self.permissions.iter_mut().find(|p| p.id == *id) {
+                    p.decided = Some(*allow);
+                    p.note = note.clone();
+                }
+            }
         }
     }
 
@@ -230,7 +430,17 @@ impl State {
             from: e.actor.clone(),
             scope,
             text,
+            mode: None,
+            from_team: None,
+            reactions: vec![],
         });
+    }
+
+    /// True if `name` is an active lead and no other active lead exists.
+    fn is_only_lead(&self, name: &str) -> bool {
+        let Some(t) = &self.team else { return false };
+        let mut leads = t.members.iter().filter(|m| !m.removed && m.role == "lead");
+        leads.clone().any(|m| m.name == name) && leads.all(|m| m.name == name)
     }
 
     fn require_task(&self, id: &str) -> Result<&Task, CoreError> {
@@ -263,6 +473,11 @@ impl State {
     pub fn decide(&self, cmd: Command) -> Result<EventKind, CoreError> {
         use Command as C;
         use EventKind as E;
+        if self.team.as_ref().is_some_and(|t| t.deleted)
+            && !matches!(cmd, C::DeleteTeam { deleted: false })
+        {
+            return Err(CoreError::TeamDeleted);
+        }
         match cmd {
             C::CreateTeam { name } => {
                 if self.team.is_some() {
@@ -270,14 +485,24 @@ impl State {
                 }
                 Ok(E::TeamCreated { name })
             }
-            C::AddMember { name, role } => {
+            C::AddMember {
+                name,
+                role,
+                runtime,
+            } => {
                 if self.team.is_none() {
                     return Err(CoreError::TeamNotCreated);
                 }
-                if self.is_member(&name) {
+                check_runtime(&runtime)?;
+                // Removed members keep their name reserved: restore them instead.
+                if self.has_member_record(&name) {
                     return Err(CoreError::MemberExists(name));
                 }
-                Ok(E::MemberAdded { name, role })
+                Ok(E::MemberAdded {
+                    name,
+                    role,
+                    runtime,
+                })
             }
             C::CreateTask {
                 id,
@@ -318,6 +543,24 @@ impl State {
                 Ok(E::TaskDependenciesSet {
                     task,
                     blocked_by: dedup(blocked_by),
+                })
+            }
+            C::UpdateTask {
+                task,
+                subject,
+                description,
+            } => {
+                self.require_task(&task)?;
+                if subject.is_none() && description.is_none() {
+                    return Err(CoreError::EmptyUpdate);
+                }
+                if subject.as_ref().is_some_and(|s| s.trim().is_empty()) {
+                    return Err(CoreError::EmptySubject);
+                }
+                Ok(E::TaskUpdated {
+                    task,
+                    subject,
+                    description,
                 })
             }
             C::AssignTask { task, owner } => {
@@ -388,11 +631,91 @@ impl State {
                 Self::check(self.require_task(&task)?, Status::NeedsFix)?;
                 Ok(E::ReviewChangesRequested { task, comment })
             }
-            C::SendMessage { to, text } => {
+            C::SendMessage {
+                to,
+                text,
+                mode,
+                from_team,
+            } => {
                 if let Some(to) = &to {
                     self.require_member(to)?;
                 }
-                Ok(E::MessageSent { to, text })
+                if let Some(m) = &mode {
+                    if !matches!(m.as_str(), "do" | "ask" | "delegate") {
+                        return Err(CoreError::InvalidMode(m.clone()));
+                    }
+                }
+                Ok(E::MessageSent {
+                    to,
+                    text,
+                    mode,
+                    from_team,
+                })
+            }
+            C::ConfigureTeam {
+                project_path,
+                lead_prompt,
+            } => {
+                if self.team.is_none() {
+                    return Err(CoreError::TeamNotCreated);
+                }
+                if project_path.is_none() && lead_prompt.is_none() {
+                    return Err(CoreError::EmptyConfig);
+                }
+                Ok(E::TeamConfigured {
+                    project_path,
+                    lead_prompt,
+                })
+            }
+            C::UpdateMember {
+                name,
+                role,
+                prompt,
+                model,
+                runtime,
+                worktree,
+                icon,
+            } => {
+                self.require_member(&name)?;
+                if role.is_none()
+                    && prompt.is_none()
+                    && model.is_none()
+                    && runtime.is_none()
+                    && worktree.is_none()
+                    && icon.is_none()
+                {
+                    return Err(CoreError::EmptyMemberUpdate);
+                }
+                check_runtime(&runtime)?;
+                if role.as_ref().is_some_and(|r| r.trim().is_empty()) {
+                    return Err(CoreError::EmptyRole);
+                }
+                // Demoting the only lead would leave the team leaderless.
+                if let Some(r) = &role {
+                    if r != "lead" && self.is_only_lead(&name) {
+                        return Err(CoreError::LastLead(name));
+                    }
+                }
+                Ok(E::MemberUpdated {
+                    name,
+                    role,
+                    prompt,
+                    model,
+                    runtime,
+                    worktree,
+                    icon,
+                })
+            }
+            C::RemoveMember { name, removed } => {
+                if removed {
+                    self.require_member(&name)?;
+                    if self.is_only_lead(&name) {
+                        return Err(CoreError::LastLead(name));
+                    }
+                } else if !self.has_member_record(&name) {
+                    return Err(CoreError::UnknownMember(name));
+                }
+                Ok(E::MemberRemoved { name, removed })
             }
             C::RegisterProcess {
                 pid,
@@ -418,7 +741,145 @@ impl State {
                 }
                 Ok(E::ProcessStopped { pid })
             }
+            C::SetClarification { task, question } => {
+                self.require_task(&task)?;
+                if question.as_ref().is_some_and(|q| q.trim().is_empty()) {
+                    return Err(CoreError::EmptyField("clarification question"));
+                }
+                Ok(E::TaskClarificationSet { task, question })
+            }
+            C::AttachFile { task, name, path } => {
+                self.require_task(&task)?;
+                if name.trim().is_empty() {
+                    return Err(CoreError::EmptyField("attachment name"));
+                }
+                if path.trim().is_empty() {
+                    return Err(CoreError::EmptyField("attachment path"));
+                }
+                Ok(E::TaskFileAttached { task, name, path })
+            }
+            C::LinkTasks {
+                task,
+                related,
+                linked,
+            } => {
+                self.require_task(&task)?;
+                self.require_task(&related)?;
+                if task == related {
+                    return Err(CoreError::InvalidLink { task, related });
+                }
+                Ok(E::TasksLinked {
+                    task,
+                    related,
+                    linked,
+                })
+            }
+            C::StartReview { task } => {
+                let t = self.require_task(&task)?;
+                if t.status != Status::Review {
+                    return Err(CoreError::NotInReview {
+                        task,
+                        status: t.status,
+                    });
+                }
+                Ok(E::ReviewStarted { task })
+            }
+            C::SetColumnOrder { column, order } => {
+                if self.team.is_none() {
+                    return Err(CoreError::TeamNotCreated);
+                }
+                if serde_json::from_value::<Status>(serde_json::Value::String(column.clone()))
+                    .is_err()
+                {
+                    return Err(CoreError::UnknownColumn(column));
+                }
+                for id in &order {
+                    self.require_task(id)?;
+                }
+                Ok(E::ColumnOrderSet {
+                    column,
+                    order: dedup(order),
+                })
+            }
+            C::DeleteTeam { deleted } => {
+                if self.team.is_none() {
+                    return Err(CoreError::TeamNotCreated);
+                }
+                Ok(E::TeamDeleted { deleted })
+            }
+            C::React { message_seq, emoji } => {
+                if !self.messages.iter().any(|m| m.seq == message_seq) {
+                    return Err(CoreError::MessageNotFound(message_seq));
+                }
+                if emoji.trim().is_empty() {
+                    return Err(CoreError::EmptyField("emoji"));
+                }
+                Ok(E::MessageReacted { message_seq, emoji })
+            }
+            C::SetSchedule { schedule } => {
+                if self.team.is_none() {
+                    return Err(CoreError::TeamNotCreated);
+                }
+                if schedule.id.trim().is_empty() {
+                    return Err(CoreError::EmptyField("schedule id"));
+                }
+                if schedule.prompt.trim().is_empty() {
+                    return Err(CoreError::EmptyField("schedule prompt"));
+                }
+                if schedule.every_minutes < 1 {
+                    return Err(CoreError::InvalidInterval);
+                }
+                self.require_member(&schedule.member)?;
+                Ok(E::ScheduleSet { schedule })
+            }
+            C::RemoveSchedule { id } => {
+                let exists = self
+                    .team
+                    .as_ref()
+                    .is_some_and(|t| t.schedules.iter().any(|s| s.id == id));
+                if !exists {
+                    return Err(CoreError::ScheduleNotFound(id));
+                }
+                Ok(E::ScheduleRemoved { id })
+            }
+            C::RequestPermission {
+                id,
+                member,
+                tool,
+                input,
+            } => {
+                self.require_member(&member)?;
+                if id.trim().is_empty() {
+                    return Err(CoreError::EmptyField("permission id"));
+                }
+                if tool.trim().is_empty() {
+                    return Err(CoreError::EmptyField("permission tool"));
+                }
+                if self.permissions.iter().any(|p| p.id == id) {
+                    return Err(CoreError::PermissionExists(id));
+                }
+                Ok(E::PermissionRequested {
+                    id,
+                    member,
+                    tool,
+                    input,
+                })
+            }
+            C::DecidePermission { id, allow, note } => {
+                match self.permissions.iter().find(|p| p.id == id) {
+                    None => Err(CoreError::PermissionNotFound(id)),
+                    Some(p) if p.decided.is_some() => Err(CoreError::PermissionDecided(id)),
+                    Some(_) => Ok(E::PermissionDecided { id, allow, note }),
+                }
+            }
         }
+    }
+}
+
+fn check_runtime(runtime: &Option<String>) -> Result<(), CoreError> {
+    match runtime {
+        Some(r) if r.trim().is_empty() => Err(CoreError::EmptyRuntime),
+        _ => Ok(()),
     }
 }
 

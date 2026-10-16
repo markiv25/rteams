@@ -814,3 +814,276 @@ fn members_may_claim_unowned_tasks_but_not_steal_owned_ones() {
     );
     assert_eq!(t["task"]["owner"], "pixel");
 }
+
+#[test]
+fn task_update_policy_validation_and_idempotency() {
+    let s = Server::new();
+    owned_task(&s);
+    let (e, b) = call(
+        &s,
+        "task_update",
+        json!({ "task": "1", "actor": "pixel", "subject": "x" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "forbidden");
+    let (e, b) = call(&s, "task_update", json!({ "task": "1", "actor": "echo" }));
+    assert!(e);
+    assert_eq!(b["code"], "empty_update");
+    let (_, b) = call(
+        &s,
+        "task_update",
+        json!({ "task": "1", "actor": "echo", "subject": " " }),
+    );
+    assert_eq!(b["code"], "empty_subject");
+    let (_, b) = call(
+        &s,
+        "task_update",
+        json!({ "task": "9", "actor": "echo", "subject": "x" }),
+    );
+    assert_eq!(b["code"], "task_not_found");
+
+    let a = json!({ "task": "1", "actor": "echo", "subject": "new", "description": "d", "command_id": "u1" });
+    let first = ok(&s, "task_update", a.clone());
+    assert_eq!(first["task"]["subject"], "new");
+    assert_eq!(first["task"]["description"], "d");
+    let again = ok(&s, "task_update", a);
+    assert_eq!(first["event_seq"], again["event_seq"]);
+    // a lead may edit too
+    let t = ok(
+        &s,
+        "task_update",
+        json!({ "task": "1", "actor": "team-lead", "subject": "lead" }),
+    );
+    assert_eq!(t["task"]["subject"], "lead");
+    assert_eq!(t["task"]["description"], "d");
+}
+
+#[test]
+fn member_add_is_lead_only_and_idempotent() {
+    let s = Server::new();
+    team(&s);
+    let (e, b) = call(
+        &s,
+        "member_add",
+        json!({ "actor": "echo", "name": "ember", "role": "qa" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "forbidden");
+    let a = json!({ "actor": "team-lead", "name": "ember", "role": "qa", "command_id": "m1" });
+    let t = ok(&s, "member_add", a.clone());
+    let members = t["team"]["members"].as_array().unwrap();
+    assert!(members
+        .iter()
+        .any(|m| m["name"] == "ember" && m["role"] == "qa"));
+    let n = members.len();
+    let t = ok(&s, "member_add", a);
+    assert_eq!(t["team"]["members"].as_array().unwrap().len(), n);
+    let (e, b) = call(
+        &s,
+        "member_add",
+        json!({ "actor": "team-lead", "name": "ember", "role": "qa" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "member_exists");
+    ok(
+        &s,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "s", "owner": "ember" }),
+    );
+}
+
+#[test]
+fn team_configure_lead_only_idempotent_and_in_briefing() {
+    let s = Server::new();
+    team(&s);
+    let (e, b) = call(
+        &s,
+        "team_configure",
+        json!({ "actor": "echo", "lead_prompt": "x" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "forbidden");
+    let a = json!({ "actor": "team-lead", "project_path": "/proj", "lead_prompt": "ship it", "command_id": "c1" });
+    let t = ok(&s, "team_configure", a.clone());
+    assert_eq!(t["team"]["project_path"], "/proj");
+    let seq = ok(&s, "inbox_get", json!({ "member": "echo" }))["inbox"]["next_cursor"].clone();
+    ok(&s, "team_configure", a);
+    assert_eq!(
+        ok(&s, "inbox_get", json!({ "member": "echo" }))["inbox"]["next_cursor"],
+        seq
+    );
+    let (e, b) = call(&s, "team_configure", json!({ "actor": "team-lead" }));
+    assert!(e);
+    assert_eq!(b["code"], "empty_config");
+    ok(
+        &s,
+        "member_update",
+        json!({ "actor": "echo", "name": "echo", "prompt": "be terse" }),
+    );
+    let b = ok(&s, "member_briefing", json!({ "member": "echo" }));
+    assert_eq!(b["member_briefing"]["lead_prompt"], "ship it");
+    assert_eq!(b["member_briefing"]["project_path"], "/proj");
+    assert_eq!(b["member_briefing"]["you"]["prompt"], "be terse");
+}
+
+#[test]
+fn member_update_policy() {
+    let s = Server::new();
+    team(&s);
+    // Own prompt/model: allowed. Own role: forbidden. Someone else's: forbidden.
+    let t = ok(
+        &s,
+        "member_update",
+        json!({ "actor": "echo", "name": "echo", "prompt": "p", "model": "m", "command_id": "u" }),
+    );
+    let echo = t["team"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "echo")
+        .unwrap()
+        .clone();
+    assert_eq!(echo["prompt"], "p");
+    assert_eq!(echo["model"], "m");
+    assert_eq!(echo["role"], "developer");
+    for args in [
+        json!({ "actor": "echo", "name": "echo", "role": "lead" }),
+        json!({ "actor": "echo", "name": "pixel", "prompt": "x" }),
+    ] {
+        let (e, b) = call(&s, "member_update", args);
+        assert!(e);
+        assert_eq!(b["code"], "forbidden");
+    }
+    let t = ok(
+        &s,
+        "member_update",
+        json!({ "actor": "team-lead", "name": "pixel", "role": "qa" }),
+    );
+    assert!(t["team"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["name"] == "pixel" && m["role"] == "qa"));
+    let (e, b) = call(
+        &s,
+        "member_update",
+        json!({ "actor": "team-lead", "name": "pixel", "role": " " }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "empty_role");
+    let (e, b) = call(
+        &s,
+        "member_update",
+        json!({ "actor": "team-lead", "name": "ghost", "prompt": "x" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "unknown_member");
+}
+
+#[test]
+fn removed_member_cannot_act_and_is_hidden() {
+    let s = Server::new();
+    team(&s);
+    ok(
+        &s,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "s", "owner": "echo" }),
+    );
+    let (e, b) = call(
+        &s,
+        "member_remove",
+        json!({ "actor": "echo", "name": "pixel" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "forbidden");
+    let a = json!({ "actor": "team-lead", "name": "echo", "command_id": "r1" });
+    let t = ok(&s, "member_remove", a.clone());
+    let n = t["team"]["members"].as_array().unwrap().len();
+    // Kept in the roster, flagged removed; replay does not append again.
+    assert!(t["team"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["name"] == "echo" && m["removed"] == true));
+    let t = ok(&s, "member_remove", a);
+    assert_eq!(t["team"]["members"].as_array().unwrap().len(), n);
+
+    // The removed member (even as the task owner) can do nothing.
+    for (name, args) in [
+        ("task_start", json!({ "task": "1", "actor": "echo" })),
+        (
+            "task_add_comment",
+            json!({ "task": "1", "actor": "echo", "text": "x" }),
+        ),
+        ("message_send", json!({ "actor": "echo", "text": "x" })),
+        (
+            "member_update",
+            json!({ "actor": "echo", "name": "echo", "prompt": "x" }),
+        ),
+    ] {
+        let (e, b) = call(&s, name, args);
+        assert!(e, "{name} should fail");
+        assert!(
+            b["code"] == "forbidden" || b["code"] == "unknown_member",
+            "{name}: {b}"
+        );
+    }
+    let (e, b) = call(&s, "member_briefing", json!({ "member": "echo" }));
+    assert!(e);
+    assert_eq!(b["code"], "unknown_member");
+    // Cannot be assigned work.
+    let (e, b) = call(
+        &s,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "team-lead", "owner": "echo" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "unknown_member");
+    let b = ok(&s, "member_briefing", json!({ "member": "pixel" }));
+    assert!(b["member_briefing"]["roster"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["name"] != "echo"));
+
+    // Restore.
+    ok(
+        &s,
+        "member_remove",
+        json!({ "actor": "team-lead", "name": "echo", "removed": false }),
+    );
+    ok(&s, "task_start", json!({ "task": "1", "actor": "echo" }));
+}
+
+#[test]
+fn last_lead_cannot_be_removed() {
+    let s = Server::new();
+    team(&s);
+    let (e, b) = call(
+        &s,
+        "member_remove",
+        json!({ "actor": "team-lead", "name": "team-lead" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "last_lead");
+}
+
+#[test]
+fn message_mode_validation() {
+    let s = Server::new();
+    team(&s);
+    let (e, b) = call(
+        &s,
+        "message_send",
+        json!({ "actor": "echo", "text": "x", "mode": "yell" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "invalid_mode");
+    ok(
+        &s,
+        "message_send",
+        json!({ "actor": "echo", "to": "pixel", "text": "x", "mode": "ask" }),
+    );
+    let inbox = ok(&s, "inbox_get", json!({ "member": "pixel" }));
+    assert_eq!(inbox["inbox"]["items"][0]["mode"], "ask");
+}

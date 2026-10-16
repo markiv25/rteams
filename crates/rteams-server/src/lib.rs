@@ -10,6 +10,7 @@ mod tools;
 
 use std::io;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rteams_store::{MemoryStore, Store};
 use serde_json::{json, Value};
@@ -24,8 +25,14 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
+const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(600);
+const PERMISSION_POLL: Duration = Duration::from_millis(500);
+
 pub struct Server {
     store: Mutex<Box<dyn Store + Send>>,
+    /// The member this process serves (env `RTEAMS_MEMBER`); `permission_request` acts as them.
+    member: Option<String>,
+    permission_timeout: Duration,
 }
 
 impl Default for Server {
@@ -42,16 +49,77 @@ impl Server {
 
     /// Serve any store. Give several servers (processes) a `FileStore` over the same root
     /// and team and they share state: every tool call locks, catches up, then decides.
+    /// The identity comes from env `RTEAMS_MEMBER` and the permission wait from
+    /// `RTEAMS_PERMISSION_TIMEOUT_MS` (default 10 minutes), both read once here.
     pub fn with_store(store: impl Store + Send + 'static) -> Self {
+        let member = std::env::var("RTEAMS_MEMBER")
+            .ok()
+            .filter(|m| !m.trim().is_empty());
+        let timeout = std::env::var("RTEAMS_PERMISSION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(DEFAULT_PERMISSION_TIMEOUT, Duration::from_millis);
+        Self::with_identity(store, member).with_permission_timeout(timeout)
+    }
+
+    /// Like `with_store` but with an explicit member identity (no environment access).
+    pub fn with_identity(store: impl Store + Send + 'static, member: Option<String>) -> Self {
         Self {
             store: Mutex::new(Box::new(store)),
+            member,
+            permission_timeout: DEFAULT_PERMISSION_TIMEOUT,
         }
+    }
+
+    /// How long `permission_request` waits for a decision before denying.
+    pub fn with_permission_timeout(mut self, timeout: Duration) -> Self {
+        self.permission_timeout = timeout;
+        self
     }
 
     /// Run a tool directly (no JSON-RPC framing). `Ok` is the tool's JSON result.
     pub fn call_tool(&self, name: &str, args: Value) -> Result<Value, ToolError> {
+        if name == "permission_request" {
+            return self.permission_request(args);
+        }
         let mut store = self.store.lock().expect("store lock poisoned");
         tools::call(&mut **store, name, args)
+    }
+
+    /// Append a permission request for this process's member, then wait for a decision. The
+    /// store lock is held only for each short check, never while sleeping, so the lead (or any
+    /// other process) can decide in the meantime. No decision before the timeout denies.
+    fn permission_request(&self, raw: Value) -> Result<Value, ToolError> {
+        let a: tools::PermissionRequestArgs =
+            serde_json::from_value(raw).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        let member = self.member.clone().ok_or_else(|| {
+            ToolError::Forbidden("RTEAMS_MEMBER is not set for this server process".into())
+        })?;
+        let input = a.input.clone();
+        let id = {
+            let mut store = self.store.lock().expect("store lock poisoned");
+            tools::permission_open(&mut **store, &member, a)?
+        };
+        let deadline = Instant::now() + self.permission_timeout;
+        loop {
+            let decided = {
+                let mut store = self.store.lock().expect("store lock poisoned");
+                let mut d = tools::permission_poll(&mut **store, &id)?;
+                if d.is_none() && Instant::now() >= deadline {
+                    tools::permission_expire(&mut **store, &member, &id);
+                    d = tools::permission_poll(&mut **store, &id)?;
+                }
+                d
+            };
+            if let Some((allow, note)) = decided {
+                return Ok(if allow {
+                    json!({ "behavior": "allow", "updatedInput": input })
+                } else {
+                    json!({ "behavior": "deny", "message": note.unwrap_or_else(|| "Denied by the lead".into()) })
+                });
+            }
+            std::thread::sleep(PERMISSION_POLL);
+        }
     }
 
     /// Handle one raw JSON-RPC message line. `None` for notifications and client responses.

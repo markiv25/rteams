@@ -22,6 +22,7 @@ fn setup(store: &mut impl Store) {
                 Command::AddMember {
                     name: n.into(),
                     role: r.into(),
+                    runtime: None,
                 },
             )
             .unwrap();
@@ -82,15 +83,19 @@ fn script() -> Vec<(&'static str, Command)> {
         (
             "lead",
             Command::SendMessage {
+                mode: None,
                 to: Some("echo".into()),
                 text: "hi".into(),
+                from_team: None,
             },
         ),
         (
             "lead",
             Command::SendMessage {
+                mode: None,
                 to: None,
                 text: "all".into(),
+                from_team: None,
             },
         ),
         (
@@ -212,8 +217,10 @@ fn second_handle_sees_writes_from_first() {
             "lead",
             10,
             Command::SendMessage {
+                mode: None,
                 to: None,
                 text: "from b".into(),
+                from_team: None,
             },
         )
         .unwrap();
@@ -222,8 +229,10 @@ fn second_handle_sees_writes_from_first() {
             "lead",
             11,
             Command::SendMessage {
+                mode: None,
                 to: None,
                 text: "from a".into(),
+                from_team: None,
             },
         )
         .unwrap();
@@ -249,8 +258,10 @@ fn concurrent_writers_keep_seq_gapless() {
                         "lead",
                         0,
                         Command::SendMessage {
+                            mode: None,
                             to: None,
                             text: format!("{w}-{i}"),
+                            from_team: None,
                         },
                     )
                     .unwrap();
@@ -306,8 +317,10 @@ fn torn_tail_is_ignored_then_repaired() {
             "lead",
             9,
             Command::SendMessage {
+                mode: None,
                 to: None,
                 text: "after crash".into(),
+                from_team: None,
             },
         )
         .unwrap();
@@ -613,4 +626,88 @@ fn read_only_refuses_writes_and_leaves_a_torn_tail_alone() {
     assert!(matches!(err, StoreError::ReadOnly));
     assert!(matches!(r.rewrite_snapshots(), Err(StoreError::ReadOnly)));
     assert_eq!(std::fs::read(&log).unwrap(), before, "log untouched");
+}
+
+#[test]
+fn wave3_events_persist_replay_and_link_snapshots_both_tasks() {
+    use rteams_core::Schedule;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut s = FileStore::open(dir.path(), "t").unwrap();
+        let run = |s: &mut FileStore, cmd: Command| {
+            s.execute("lead", 1, cmd).unwrap();
+        };
+        run(&mut s, Command::CreateTeam { name: "t".into() });
+        run(
+            &mut s,
+            Command::AddMember {
+                name: "lead".into(),
+                role: "lead".into(),
+                runtime: Some("codex".into()),
+            },
+        );
+        for id in ["1", "2"] {
+            run(
+                &mut s,
+                Command::CreateTask {
+                    id: id.into(),
+                    subject: "s".into(),
+                    description: String::new(),
+                    owner: None,
+                    blocked_by: vec![],
+                },
+            );
+        }
+        run(
+            &mut s,
+            Command::LinkTasks {
+                task: "1".into(),
+                related: "2".into(),
+                linked: true,
+            },
+        );
+        run(
+            &mut s,
+            Command::SetSchedule {
+                schedule: Schedule {
+                    id: "s".into(),
+                    member: "lead".into(),
+                    prompt: "p".into(),
+                    every_minutes: 3,
+                    enabled: true,
+                    cron: None,
+                    timezone: None,
+                    warmup_minutes: None,
+                },
+            },
+        );
+        run(
+            &mut s,
+            Command::RequestPermission {
+                id: "p1".into(),
+                member: "lead".into(),
+                tool: "Bash".into(),
+                input: serde_json::json!({ "a": 1 }),
+            },
+        );
+        run(&mut s, Command::DeleteTeam { deleted: true });
+    }
+    let mut s = FileStore::open(dir.path(), "t").unwrap();
+    let st = s.state().unwrap();
+    assert_eq!(st.task("2").unwrap().related, vec!["1"]);
+    assert_eq!(st.permissions[0].input, serde_json::json!({ "a": 1 }));
+    let team = st.team.as_ref().unwrap();
+    assert!(team.deleted);
+    assert_eq!(team.schedules.len(), 1);
+    assert_eq!(team.members[0].runtime.as_deref(), Some("codex"));
+    for id in ["1", "2"] {
+        let snap = std::fs::read_to_string(dir.path().join(format!("t/tasks/{id}.json"))).unwrap();
+        assert!(snap.contains("\"related\""), "snapshot {id}: {snap}");
+    }
+    assert!(matches!(
+        s.execute("lead", 2, Command::StopProcess { pid: 1 }),
+        Err(rteams_store::StoreError::Core(
+            rteams_core::CoreError::TeamDeleted
+        ))
+    ));
 }

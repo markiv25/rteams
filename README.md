@@ -70,29 +70,49 @@ claude --allowedTools "mcp__rteams"      # all rteams tools, no per-call prompts
 |---|---|
 | `--home DIR` / `RTEAMS_HOME` | Shared state root. State lives in `<home>/<team>/events.jsonl`. Omit for in-memory state private to that process (fine for a demo, useless for several agents). |
 | `--team NAME` / `RTEAMS_TEAM` | Team directory under the home. Default `default`. |
+| `RTEAMS_MEMBER` | The member this server process acts as. Required by `permission_request` (the launcher sets it per agent). |
+| `RTEAMS_PERMISSION_TIMEOUT_MS` | How long `permission_request` waits for a lead's decision before denying. Default 600000 (10 min). |
 
 Flags win over environment variables. Every agent that should see the same board must use the
 same home and team. Writes take a file lock, catch up with other processes, then validate against
 the latest state, so concurrent agents are safe.
 
-## Visual board (rteams-gui)
+## Desktop app (rteams-gui)
 
-`rteams-gui` opens a native window with the live kanban board (Todo / In Progress / Review /
-Approved / Done). It is read-only and reads the same `RTEAMS_HOME` the MCP server writes, so
-cards move as agents work (it polls the log every 500 ms). Click a card for its details; `Esc`
-closes the panel.
+`rteams-gui` is a native Rust rebuild of [agent-teams-ai](https://github.com/777genius/agent-teams-ai):
+you are the lead, Claude Code agents are your team, you watch the kanban and give commands. Same
+dark "Midnight Slate" look; no Electron, no provider zoo, no cloud.
+
+- **Tabs:** the team, and `Teams` (all teams under the home; search, `Create Team`, switch).
+- **Messages (left):** Group chat + one chat per agent, unread badges (saved per team),
+  full-screen chat with a composer: recipient, `Do | Ask | Delegate`, Send.
+- **Team:** header with project path, `Launch` / `Stop team`, offline banner, `⚙ Settings`
+  (project path, lead prompt); member rows with status, task progress, chat, assign, launch /
+  stop / restart; `+ Add` teammate; member dialog (tasks, logs, messages, edit role / model /
+  standing prompt, remove / restore).
+- **Kanban:** TODO / IN PROGRESS / REVIEW / DONE / APPROVED in the original 3+2 grid or a
+  columns view; search (`#id` or text), filters, sort, hover actions, Trash with restore.
+- **Task dialog:** edit title / description, actions for the current status, related tasks,
+  task logs, workflow history, comments.
+- **Claude Logs** and **Processes** sections; OS notifications for reviews, messages, done.
+
+**How agents run (token-frugal by design).** Each agent is a one-shot `claude -p` run wired to
+`rteams serve` for the team. Nobody idles or polls: the GUI wakes an agent only when the log
+gives it work (a message to it, an assignment, a review request, changes requested, a comment
+on its task, an unblock), coalesces bursts (2 s debounce), rate-limits (20 s gap, 6/hour) and
+caps concurrency at 3. The wake prompt already holds the reason, the agent's top tasks and
+unread messages, so it skips briefing calls; each member's Claude session is resumed. Modes:
+`Do` (full tools), `Ask` (read-only), `Delegate` (only rteams tools: create and assign tasks).
+Agents run with all permissions (`--dangerously-skip-permissions`), like the original. Runs are
+recorded to `<home>/<team>/runs/<member>/*.jsonl`; sessions in `<home>/<team>/sessions.json`.
 
 ```sh
-# from the repo, with some state already in /tmp/rteams-demo:
-cargo run -p rteams-gui -- --home /tmp/rteams-demo --team demo
-
-# or build once and run the binary (target/release/rteams-gui, ~6.6 MB):
-cargo build --release -p rteams-gui
-./target/release/rteams-gui --home /tmp/rteams-demo --team demo
+cargo build --release -p rteams-gui -p rteams-cli   # gui finds `rteams` next to itself
+./target/release/rteams-gui --home ~/rteams-home --team demo
 ```
 
-Flags: `--home DIR` (env `RTEAMS_HOME`, required) and `--team NAME` (env `RTEAMS_TEAM`, default
-`default`), the same as the server. Point it at the home your agents use and you see their board.
+Flags: `--home DIR` (env `RTEAMS_HOME`, required), `--team NAME` (env `RTEAMS_TEAM`, default
+`default`), `--as NAME` (env `RTEAMS_ACTOR`, default: the team's lead).
 
 ## Things to know when calling the tools
 
@@ -111,10 +131,22 @@ Flags: `--home DIR` (env `RTEAMS_HOME`, required) and `--team NAME` (env `RTEAMS
   body, so the model can read and react. Malformed arguments and unknown tools are JSON-RPC
   `-32602` errors.
 - **Tools:** `team_create`, `team_get`, `task_create`, `task_get`, `task_list`, `task_start`,
-  `task_complete`, `task_set_dependencies`, `task_set_owner`, `task_add_comment`, `task_block`,
+  `task_complete`, `task_set_dependencies`, `task_set_owner`, `task_update`, `member_add`, `member_update`, `member_remove`, `team_configure`, `task_add_comment`, `task_block`,
   `task_unblock`, `task_archive`, `task_briefing`, `member_briefing`, `kanban_get`,
   `review_request`, `review_approve`, `review_request_changes`, `message_send`, `inbox_get`,
-  `process_register`, `process_list`, `process_unregister`. `tools/list` is the source of truth.
+  `process_register`, `process_list`, `process_unregister`, plus: `task_set_clarification`,
+  `task_attach_file`, `task_link`, `task_unlink`, `review_start`, `kanban_set_order` (lead),
+  `team_delete` (lead; a deleted team rejects all writes except `deleted=false`), `message_react`
+  (toggle), `schedule_set` / `schedule_remove` (lead), `permission_decide` (lead),
+  `task_create_from_message`, and `permission_request`. `member_add` / `member_update` accept
+  `runtime` (`claude` default, `codex`, `opencode`, `cursor`, `gemini`, ...) and `member_update`
+  accepts `worktree`; `message_send` accepts `from_team` for cross-team delivery.
+  `tools/list` is the source of truth.
+
+`permission_request {tool_name, input}` is the Claude `--permission-prompt-tool` contract: it
+records a request for `RTEAMS_MEMBER`, then blocks (polling the shared log every 500 ms, without
+holding the store lock) until a lead calls `permission_decide`, or denies on timeout. The reply
+text is `{"behavior":"allow","updatedInput":...}` or `{"behavior":"deny","message":...}`.
 
 ## Troubleshooting
 

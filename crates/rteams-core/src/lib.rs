@@ -15,7 +15,10 @@ pub mod state;
 pub mod store;
 
 pub use command::Command;
-pub use domain::{Member, Message, ProcessEntry, Scope, Task, Team};
+pub use domain::{
+    Attachment, Member, Message, PermissionRequest, ProcessEntry, Reaction, Schedule, Scope, Task,
+    Team,
+};
 pub use error::CoreError;
 pub use event::{Event, EventKind};
 pub use lifecycle::Status;

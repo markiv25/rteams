@@ -24,6 +24,8 @@ pub enum EventKind {
     MemberAdded {
         name: String,
         role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
     },
     TaskCreated {
         task: String,
@@ -37,6 +39,14 @@ pub enum EventKind {
     TaskDependenciesSet {
         task: String,
         blocked_by: Vec<String>,
+    },
+    /// Only the fields that changed are present, so old logs and readers are unaffected.
+    TaskUpdated {
+        task: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     TaskAssigned {
         task: String,
@@ -80,6 +90,36 @@ pub enum EventKind {
     MessageSent {
         to: Option<String>,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_team: Option<String>,
+    },
+    /// Only the fields that changed are present.
+    TeamConfigured {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lead_prompt: Option<String>,
+    },
+    MemberUpdated {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
+    },
+    MemberRemoved {
+        name: String,
+        removed: bool,
     },
     ProcessRegistered {
         pid: u32,
@@ -90,5 +130,50 @@ pub enum EventKind {
     },
     ProcessStopped {
         pid: u32,
+    },
+    TaskClarificationSet {
+        task: String,
+        question: Option<String>,
+    },
+    TaskFileAttached {
+        task: String,
+        name: String,
+        path: String,
+    },
+    TasksLinked {
+        task: String,
+        related: String,
+        linked: bool,
+    },
+    ReviewStarted {
+        task: String,
+    },
+    ColumnOrderSet {
+        column: String,
+        order: Vec<String>,
+    },
+    TeamDeleted {
+        deleted: bool,
+    },
+    MessageReacted {
+        message_seq: u64,
+        emoji: String,
+    },
+    ScheduleSet {
+        schedule: crate::Schedule,
+    },
+    ScheduleRemoved {
+        id: String,
+    },
+    PermissionRequested {
+        id: String,
+        member: String,
+        tool: String,
+        input: serde_json::Value,
+    },
+    PermissionDecided {
+        id: String,
+        allow: bool,
+        note: Option<String>,
     },
 }
