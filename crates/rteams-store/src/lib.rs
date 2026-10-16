@@ -84,10 +84,6 @@ pub trait Store {
         Ok(self.execute_with_id(actor, ts, None, cmd)?.event)
     }
 
-    /// The event a previous command with this id produced, if any. Lets callers short-circuit
-    /// a retry before re-running checks that would now fail against the already-changed state.
-    fn replay(&mut self, command_id: &str) -> Result<Option<Event>, StoreError>;
-
     fn events(&mut self) -> Result<&[Event], StoreError>;
     fn state(&mut self) -> Result<&State, StoreError>;
 }
@@ -132,13 +128,6 @@ impl Store for MemoryStore {
             event,
             replayed: false,
         })
-    }
-
-    fn replay(&mut self, command_id: &str) -> Result<Option<Event>, StoreError> {
-        Ok(self
-            .commands
-            .get(command_id)
-            .map(|&i| self.mem.events()[i].clone()))
     }
 
     fn events(&mut self) -> Result<&[Event], StoreError> {
