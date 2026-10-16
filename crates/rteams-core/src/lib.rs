@@ -20,7 +20,9 @@ pub use error::CoreError;
 pub use event::{Event, EventKind};
 pub use lifecycle::Status;
 pub use projection::{
-    briefing, inbox, kanban, process_list, Briefing, BriefingItem, Card, Inbox, KanbanBoard, Reason,
+    briefing, inbox, kanban, lead_briefing, member_briefing, process_list, BoardCounts, Briefing,
+    BriefingItem, Card, Inbox, KanbanBoard, LeadBriefing, LeadItem, LeadReason, MemberBriefing,
+    MemberLoad, QueueSummary, Reason,
 };
 pub use state::State;
 pub use store::MemStore;

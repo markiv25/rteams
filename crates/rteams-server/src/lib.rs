@@ -11,7 +11,7 @@ mod tools;
 use std::io;
 use std::sync::Mutex;
 
-use rteams_core::MemStore;
+use rteams_store::{MemoryStore, Store};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -25,7 +25,7 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
 pub struct Server {
-    store: Mutex<MemStore>,
+    store: Mutex<Box<dyn Store + Send>>,
 }
 
 impl Default for Server {
@@ -35,20 +35,23 @@ impl Default for Server {
 }
 
 impl Server {
+    /// Ephemeral, in-process state (tests, throwaway servers).
     pub fn new() -> Self {
-        Self::with_store(MemStore::new())
+        Self::with_store(MemoryStore::new())
     }
 
-    pub fn with_store(store: MemStore) -> Self {
+    /// Serve any store. Give several servers (processes) a `FileStore` over the same root
+    /// and team and they share state: every tool call locks, catches up, then decides.
+    pub fn with_store(store: impl Store + Send + 'static) -> Self {
         Self {
-            store: Mutex::new(store),
+            store: Mutex::new(Box::new(store)),
         }
     }
 
     /// Run a tool directly (no JSON-RPC framing). `Ok` is the tool's JSON result.
     pub fn call_tool(&self, name: &str, args: Value) -> Result<Value, ToolError> {
         let mut store = self.store.lock().expect("store lock poisoned");
-        tools::call(&mut store, name, args)
+        tools::call(&mut **store, name, args)
     }
 
     /// Handle one raw JSON-RPC message line. `None` for notifications and client responses.
@@ -103,6 +106,15 @@ impl Server {
             // Domain failures are tool errors the model can read and react to.
             Err(ToolError::Core(e)) => {
                 let body = json!({ "code": tools::error_code(&e), "message": e.to_string() });
+                rpc_result(id, tool_result(&body, true))
+            }
+            // Storage failures (I/O, corrupt log) are also readable by the model, not protocol errors.
+            Err(ToolError::Store(message)) => {
+                let body = json!({ "code": "store_error", "message": message });
+                rpc_result(id, tool_result(&body, true))
+            }
+            Err(ToolError::Forbidden(m)) => {
+                let body = json!({ "code": "forbidden", "message": m });
                 rpc_result(id, tool_result(&body, true))
             }
             Err(e @ ToolError::UnknownTool(_)) | Err(e @ ToolError::InvalidArguments(_)) => {

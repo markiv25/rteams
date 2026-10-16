@@ -2,8 +2,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::thread;
 
-use rteams_core::{briefing, inbox, kanban, Command, CoreError, MemStore, Scope, State, Status};
-use rteams_store::{FileStore, Store, StoreError};
+use rteams_core::{briefing, inbox, kanban, Command, CoreError, Scope, State, Status};
+use rteams_store::{FileStore, MemoryStore, Store, StoreError};
 use tempfile::TempDir;
 
 fn setup(store: &mut impl Store) {
@@ -123,20 +123,20 @@ fn run_script(store: &mut impl Store) {
 fn matches_memstore_exactly() {
     let dir = TempDir::new().unwrap();
     let mut file = FileStore::open(dir.path(), "t").unwrap();
-    let mut mem = MemStore::new();
+    let mut mem = MemoryStore::new();
     setup(&mut file);
     setup(&mut mem);
     run_script(&mut file);
     run_script(&mut mem);
-    assert_eq!(file.events().unwrap(), mem.events());
-    assert_eq!(kanban(file.state().unwrap()), kanban(mem.state()));
+    assert_eq!(file.events().unwrap(), mem.events().unwrap());
+    assert_eq!(kanban(file.state().unwrap()), kanban(mem.state().unwrap()));
     assert_eq!(
         briefing(file.state().unwrap(), "echo"),
-        briefing(mem.state(), "echo")
+        briefing(mem.state().unwrap(), "echo")
     );
     assert_eq!(
         inbox(file.state().unwrap(), "echo", 0),
-        inbox(mem.state(), "echo", 0)
+        inbox(mem.state().unwrap(), "echo", 0)
     );
 }
 
@@ -353,21 +353,23 @@ fn command_id_is_idempotent_across_handles_and_restart() {
         blocked_by: vec![],
     };
 
-    let first = a.execute_with_id("lead", 10, "cmd-1", mk()).unwrap();
+    let first = a.execute_with_id("lead", 10, Some("cmd-1"), mk()).unwrap();
     assert!(!first.replayed);
     // a retry would normally fail with TaskExists; with the same id it returns the original event
-    let retry = a.execute_with_id("lead", 11, "cmd-1", mk()).unwrap();
+    let retry = a.execute_with_id("lead", 11, Some("cmd-1"), mk()).unwrap();
     assert!(retry.replayed);
     assert_eq!(retry.event, first.event);
 
     let mut b = FileStore::open(dir.path(), "t").unwrap();
-    let retry2 = b.execute_with_id("lead", 12, "cmd-1", mk()).unwrap();
+    let retry2 = b.execute_with_id("lead", 12, Some("cmd-1"), mk()).unwrap();
     assert!(retry2.replayed);
     assert_eq!(retry2.event.seq, first.event.seq);
     assert_eq!(b.events().unwrap().len() as u64, first.event.seq);
 
     // a different id is a new command and hits normal validation
-    let err = b.execute_with_id("lead", 13, "cmd-2", mk()).unwrap_err();
+    let err = b
+        .execute_with_id("lead", 13, Some("cmd-2"), mk())
+        .unwrap_err();
     assert!(matches!(err, StoreError::Core(CoreError::TaskExists(_))));
 }
 
@@ -511,4 +513,25 @@ fn snapshot_names_are_safe_and_collisions_fall_back_to_full_id() {
     for e in std::fs::read_dir(&tasks_dir).unwrap() {
         assert!(e.unwrap().file_name().to_string_lossy().ends_with(".json"));
     }
+}
+
+#[test]
+fn memory_store_dedups_command_ids_like_file_store() {
+    let mut m = MemoryStore::new();
+    setup(&mut m);
+    let mk = || Command::CreateTask {
+        id: "x".into(),
+        subject: "S".into(),
+        description: "".into(),
+        owner: None,
+        blocked_by: vec![],
+    };
+    let first = m.execute_with_id("lead", 10, Some("c1"), mk()).unwrap();
+    let retry = m.execute_with_id("lead", 11, Some("c1"), mk()).unwrap();
+    assert!(!first.replayed && retry.replayed);
+    assert_eq!(first.event, retry.event);
+    assert!(matches!(
+        m.execute_with_id("lead", 12, Some("c2"), mk()),
+        Err(StoreError::Core(CoreError::TaskExists(_)))
+    ));
 }

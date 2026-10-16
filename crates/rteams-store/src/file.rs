@@ -7,7 +7,7 @@ use fs2::FileExt;
 use rteams_core::{Command, Event, EventKind, Message, Scope, State, Task};
 use serde::{Deserialize, Serialize};
 
-use crate::{Store, StoreError};
+use crate::{Executed, Store, StoreError};
 
 /// One log line: the event plus an optional idempotency key, flattened into one JSON object.
 #[derive(Serialize, Deserialize)]
@@ -16,13 +16,6 @@ struct Line {
     command_id: Option<String>,
     #[serde(flatten)]
     event: Event,
-}
-
-/// Result of an idempotent execute: the event, and whether it was already in the log.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Executed {
-    pub event: Event,
-    pub replayed: bool,
 }
 
 /// Append-only JSONL event log for one team, safe across processes.
@@ -106,18 +99,6 @@ impl FileStore {
     /// unterminated tail (a write in flight, or a crash) is simply not consumed yet.
     pub fn refresh(&mut self) -> Result<(), StoreError> {
         self.catch_up(false)
-    }
-
-    /// Like `execute`, but a repeated `command_id` returns the original event instead of
-    /// appending a second one. The id is persisted atomically with the event.
-    pub fn execute_with_id(
-        &mut self,
-        actor: &str,
-        ts: i64,
-        command_id: &str,
-        cmd: Command,
-    ) -> Result<Executed, StoreError> {
-        self.write(actor, ts, Some(command_id), cmd)
     }
 
     fn write(
@@ -280,8 +261,15 @@ impl FileStore {
 }
 
 impl Store for FileStore {
-    fn execute(&mut self, actor: &str, ts: i64, cmd: Command) -> Result<Event, StoreError> {
-        Ok(self.write(actor, ts, None, cmd)?.event)
+    /// The id is persisted on the same log line as the event, so dedup and append are atomic.
+    fn execute_with_id(
+        &mut self,
+        actor: &str,
+        ts: i64,
+        command_id: Option<&str>,
+        cmd: Command,
+    ) -> Result<Executed, StoreError> {
+        self.write(actor, ts, command_id, cmd)
     }
 
     fn events(&mut self) -> Result<&[Event], StoreError> {

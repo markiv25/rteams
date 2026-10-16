@@ -11,3 +11,8 @@ path = "src/main.rs"
 [dependencies]
 rteams-server.workspace = true
 tokio.workspace = true
+rteams-store.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

@@ -402,3 +402,348 @@ fn dependencies_over_mcp() {
     );
     assert_eq!(t["task"]["blocked_by"], json!([]));
 }
+
+fn owned_task(s: &Server) {
+    team(s);
+    ok(
+        s,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "work", "owner": "echo" }),
+    );
+    ok(s, "task_start", json!({ "task": "1", "actor": "echo" }));
+}
+
+#[test]
+fn review_flow_with_policy() {
+    let s = Server::new();
+    owned_task(&s);
+
+    // owner-only request; owner cannot review themselves; reviewer must be a member
+    let req = |actor: &str, reviewer: &str| {
+        call(
+            &s,
+            "review_request",
+            json!({ "task": "1", "actor": actor, "reviewer": reviewer }),
+        )
+    };
+    assert_eq!(req("pixel", "pixel").1["code"], "forbidden");
+    assert_eq!(req("echo", "echo").1["code"], "forbidden");
+    assert_eq!(req("echo", "ghost").1["code"], "unknown_member");
+    let t = ok(
+        &s,
+        "review_request",
+        json!({ "task": "1", "actor": "echo", "reviewer": "pixel" }),
+    );
+    assert_eq!(t["task"]["status"], "review");
+    assert_eq!(t["task"]["reviewer"], "pixel");
+
+    // only the reviewer (or a lead) decides; the owner does not approve their own work
+    let (e, b) = call(
+        &s,
+        "review_approve",
+        json!({ "task": "1", "actor": "echo" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "forbidden");
+
+    // changes -> owner fixes -> second round -> approve -> done
+    let t = ok(
+        &s,
+        "review_request_changes",
+        json!({ "task": "1", "actor": "pixel", "comment": "add tests" }),
+    );
+    assert_eq!(t["task"]["status"], "needs_fix");
+    let inbox = ok(&s, "inbox_get", json!({ "member": "echo" }));
+    assert_eq!(inbox["inbox"]["items"][0]["text"], "add tests");
+
+    ok(&s, "task_start", json!({ "task": "1", "actor": "echo" }));
+    ok(
+        &s,
+        "review_request",
+        json!({ "task": "1", "actor": "echo", "reviewer": "pixel" }),
+    );
+    let t = ok(
+        &s,
+        "review_approve",
+        json!({ "task": "1", "actor": "pixel", "note": "lgtm" }),
+    );
+    assert_eq!(t["task"]["status"], "approved");
+    let t = ok(&s, "task_complete", json!({ "task": "1", "actor": "echo" }));
+    assert_eq!(t["task"]["status"], "done");
+
+    // wrong state reports the domain error, not a policy error
+    let (_, b) = call(
+        &s,
+        "review_approve",
+        json!({ "task": "1", "actor": "echo" }),
+    );
+    assert_eq!(b["code"], "illegal_transition");
+    let (_, b) = call(
+        &s,
+        "review_approve",
+        json!({ "task": "9", "actor": "echo" }),
+    );
+    assert_eq!(b["code"], "task_not_found");
+}
+
+#[test]
+fn lead_may_override_review_policy() {
+    let s = Server::new();
+    owned_task(&s);
+    ok(
+        &s,
+        "review_request",
+        json!({ "task": "1", "actor": "team-lead", "reviewer": "pixel" }),
+    );
+    let t = ok(
+        &s,
+        "review_approve",
+        json!({ "task": "1", "actor": "team-lead" }),
+    );
+    assert_eq!(t["task"]["status"], "approved");
+}
+
+#[test]
+fn messaging_and_inbox_cursor() {
+    let s = Server::new();
+    team(&s);
+
+    ok(
+        &s,
+        "message_send",
+        json!({ "actor": "pixel", "to": "echo", "text": "ping" }),
+    );
+    ok(
+        &s,
+        "message_send",
+        json!({ "actor": "team-lead", "text": "standup" }),
+    );
+    ok(
+        &s,
+        "message_send",
+        json!({ "actor": "pixel", "to": "team-lead", "text": "not for echo" }),
+    );
+
+    let i = ok(&s, "inbox_get", json!({ "member": "echo" }));
+    let texts: Vec<_> = i["inbox"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["ping", "standup"]);
+    let cursor = i["inbox"]["next_cursor"].clone();
+
+    // nothing new: same cursor back; then only newer items
+    let again = ok(
+        &s,
+        "inbox_get",
+        json!({ "member": "echo", "after": cursor }),
+    );
+    assert_eq!(again["inbox"]["items"], json!([]));
+    assert_eq!(again["inbox"]["next_cursor"], cursor);
+    ok(
+        &s,
+        "message_send",
+        json!({ "actor": "pixel", "to": "echo", "text": "again" }),
+    );
+    let newer = ok(
+        &s,
+        "inbox_get",
+        json!({ "member": "echo", "after": cursor }),
+    );
+    assert_eq!(newer["inbox"]["items"][0]["text"], "again");
+
+    // roster is enforced on both ends
+    let (e, b) = call(
+        &s,
+        "message_send",
+        json!({ "actor": "pixel", "to": "ghost", "text": "x" }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "unknown_member");
+    let (_, b) = call(&s, "message_send", json!({ "actor": "ghost", "text": "x" }));
+    assert_eq!(b["code"], "unknown_member");
+}
+
+#[test]
+fn process_registry() {
+    let s = Server::new();
+    team(&s);
+    let r = ok(
+        &s,
+        "process_register",
+        json!({ "actor": "echo", "pid": 4242, "label": "dev server", "port": 3000,
+                "url": "http://localhost:3000", "command": "npm run dev" }),
+    );
+    assert_eq!(r["processes"][0]["owner"], "echo");
+
+    let (_, b) = call(
+        &s,
+        "process_register",
+        json!({ "actor": "pixel", "pid": 4242, "label": "dup" }),
+    );
+    assert_eq!(b["code"], "process_running");
+    let (_, b) = call(
+        &s,
+        "process_register",
+        json!({ "actor": "ghost", "pid": 1, "label": "x" }),
+    );
+    assert_eq!(b["code"], "unknown_member");
+
+    let (e, b) = call(
+        &s,
+        "process_unregister",
+        json!({ "actor": "pixel", "pid": 4242 }),
+    );
+    assert!(e);
+    assert_eq!(b["code"], "forbidden");
+    assert_eq!(
+        ok(&s, "process_list", json!({}))["processes"][0]["pid"],
+        4242
+    );
+
+    // lead can clear it; the owner can too; a gone process is a typed error
+    ok(
+        &s,
+        "process_unregister",
+        json!({ "actor": "echo", "pid": 4242 }),
+    );
+    assert_eq!(ok(&s, "process_list", json!({}))["processes"], json!([]));
+    let (_, b) = call(
+        &s,
+        "process_unregister",
+        json!({ "actor": "echo", "pid": 4242 }),
+    );
+    assert_eq!(b["code"], "process_not_found");
+}
+
+#[test]
+fn lifecycle_tools_are_owner_or_lead_only() {
+    let s = Server::new();
+    team(&s);
+    ok(
+        &s,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "mine", "owner": "echo" }),
+    );
+    ok(
+        &s,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "dep", "owner": "echo" }),
+    );
+
+    // every lifecycle write is refused for a non-owner member, and leaves the task untouched
+    let writes = [
+        ("task_start", json!({})),
+        ("task_complete", json!({})),
+        ("task_set_owner", json!({ "owner": "pixel" })),
+        ("task_set_dependencies", json!({ "blocked_by": ["2"] })),
+        ("task_block", json!({ "reason": "x" })),
+        ("task_unblock", json!({})),
+        ("task_archive", json!({})),
+    ];
+    for (tool, extra) in &writes {
+        let mut a = json!({ "task": "1", "actor": "pixel" });
+        a.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (e, b) = call(&s, tool, a);
+        assert!(e, "{tool} should be refused");
+        let code = &b["code"];
+        // state errors win over policy: a pending task cannot be completed and an
+        // unblocked one cannot be unblocked, whoever asks
+        let want = match *tool {
+            "task_complete" => "illegal_transition",
+            "task_unblock" => "not_blocked",
+            _ => "forbidden",
+        };
+        assert_eq!(code, want, "{tool}: {b}");
+    }
+    let t = ok(&s, "task_get", json!({ "task": "1" }));
+    assert_eq!(t["task"]["status"], "pending");
+    assert_eq!(t["task"]["owner"], "echo");
+    assert_eq!(t["task"]["archived"], false);
+
+    // owner proceeds; a non-owner cannot complete or comment-through-state on it
+    ok(&s, "task_start", json!({ "task": "1", "actor": "echo" }));
+    let (_, b) = call(
+        &s,
+        "task_complete",
+        json!({ "task": "1", "actor": "pixel" }),
+    );
+    assert_eq!(b["code"], "forbidden");
+
+    // a wrong-state call by a non-owner reports the state error, not forbidden
+    let (_, b) = call(
+        &s,
+        "task_complete",
+        json!({ "task": "2", "actor": "pixel" }),
+    );
+    assert_eq!(b["code"], "illegal_transition");
+
+    // comments stay open to any member: that is how results are reported
+    ok(
+        &s,
+        "task_add_comment",
+        json!({ "task": "1", "actor": "pixel", "text": "fyi" }),
+    );
+}
+
+#[test]
+fn lead_may_mutate_any_task_and_reassign() {
+    let s = Server::new();
+    team(&s);
+    ok(
+        &s,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "t", "owner": "echo" }),
+    );
+
+    let t = ok(
+        &s,
+        "task_set_owner",
+        json!({ "task": "1", "actor": "team-lead", "owner": "pixel" }),
+    );
+    assert_eq!(t["task"]["owner"], "pixel");
+    // the previous owner lost the right with the assignment
+    let (_, b) = call(&s, "task_start", json!({ "task": "1", "actor": "echo" }));
+    assert_eq!(b["code"], "forbidden");
+
+    let t = ok(
+        &s,
+        "task_start",
+        json!({ "task": "1", "actor": "team-lead" }),
+    );
+    assert_eq!(t["task"]["status"], "in_progress");
+    ok(
+        &s,
+        "task_block",
+        json!({ "task": "1", "actor": "team-lead", "reason": "r" }),
+    );
+    ok(
+        &s,
+        "task_unblock",
+        json!({ "task": "1", "actor": "team-lead" }),
+    );
+    let t = ok(
+        &s,
+        "task_archive",
+        json!({ "task": "1", "actor": "team-lead" }),
+    );
+    assert_eq!(t["task"]["archived"], true);
+
+    // an unowned task is the lead's to start or assign
+    ok(
+        &s,
+        "task_create",
+        json!({ "actor": "pixel", "subject": "unowned" }),
+    );
+    let (_, b) = call(&s, "task_start", json!({ "task": "2", "actor": "pixel" }));
+    assert_eq!(b["code"], "forbidden");
+    ok(
+        &s,
+        "task_start",
+        json!({ "task": "2", "actor": "team-lead" }),
+    );
+}

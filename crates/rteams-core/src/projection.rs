@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Message, ProcessEntry, Scope, Task};
+use crate::domain::{Member, Message, ProcessEntry, Scope, Task};
 use crate::lifecycle::Status;
 use crate::state::State;
 
@@ -141,6 +141,192 @@ pub fn briefing(state: &State, member: &str) -> Briefing {
         actionable: actionable.into_iter().map(|(_, _, i)| i).collect(),
         awareness: awareness.into_iter().map(|(_, _, i)| i).collect(),
     }
+}
+
+// ---- Lead briefing: team-wide queue for whoever runs the team ----
+
+/// Why a task is in the lead's briefing. Declaration order of the actionable
+/// variants is their priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeadReason {
+    /// Actionable: a live task nobody owns; assign it.
+    Unassigned,
+    /// Actionable: parked as blocked; someone has to unblock or reassign it.
+    Blocked,
+    /// Awareness: in review, waiting on the reviewer.
+    InReview,
+    /// Awareness: approved, waiting on the owner to mark it done.
+    Approved,
+}
+
+impl LeadReason {
+    pub fn is_actionable(self) -> bool {
+        self < LeadReason::InReview
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeadItem {
+    pub task: String,
+    pub subject: String,
+    pub status: Status,
+    pub owner: Option<String>,
+    pub reviewer: Option<String>,
+    pub reason: LeadReason,
+}
+
+/// How much open work a member holds. Archived and done tasks do not count.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberLoad {
+    pub member: String,
+    pub role: String,
+    pub in_progress: usize,
+    /// pending + needs_fix
+    pub todo: usize,
+    pub review: usize,
+    pub blocked: usize,
+}
+
+/// Column sizes of the kanban board.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardCounts {
+    pub todo: usize,
+    pub in_progress: usize,
+    pub review: usize,
+    pub approved: usize,
+    pub done: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeadBriefing {
+    /// Ordered by priority, then creation.
+    pub actionable: Vec<LeadItem>,
+    /// Watch-only; ordered by creation.
+    pub awareness: Vec<LeadItem>,
+    pub counts: BoardCounts,
+    /// One row per member, in roster order.
+    pub load: Vec<MemberLoad>,
+}
+
+fn lead_reason_for(t: &Task) -> Option<LeadReason> {
+    match (t.status, t.owner.is_some()) {
+        (Status::Done, _) => None,
+        (_, false) => Some(LeadReason::Unassigned),
+        (Status::Blocked, _) => Some(LeadReason::Blocked),
+        (Status::Review, _) => Some(LeadReason::InReview),
+        (Status::Approved, _) => Some(LeadReason::Approved),
+        _ => None,
+    }
+}
+
+pub fn lead_briefing(state: &State) -> LeadBriefing {
+    let mut items: Vec<(LeadReason, u64, LeadItem)> = state
+        .tasks
+        .iter()
+        .filter(|t| !t.archived)
+        .filter_map(|t| {
+            let reason = lead_reason_for(t)?;
+            let item = LeadItem {
+                task: t.id.clone(),
+                subject: t.subject.clone(),
+                status: t.status,
+                owner: t.owner.clone(),
+                reviewer: t.reviewer.clone(),
+                reason,
+            };
+            Some((reason, t.created_seq, item))
+        })
+        .collect();
+    items.sort_by_key(|(r, seq, _)| (*r, *seq));
+    let (actionable, awareness): (Vec<_>, Vec<_>) =
+        items.into_iter().partition(|(r, _, _)| r.is_actionable());
+
+    let board = kanban(state);
+    let counts = BoardCounts {
+        todo: board.todo.len(),
+        in_progress: board.in_progress.len(),
+        review: board.review.len(),
+        approved: board.approved.len(),
+        done: board.done.len(),
+    };
+
+    let load = state
+        .team
+        .iter()
+        .flat_map(|t| &t.members)
+        .map(|m| {
+            let mut l = MemberLoad {
+                member: m.name.clone(),
+                role: m.role.clone(),
+                ..MemberLoad::default()
+            };
+            let owned = state
+                .tasks
+                .iter()
+                .filter(|t| !t.archived && t.owner.as_deref() == Some(m.name.as_str()));
+            for t in owned {
+                match t.status {
+                    Status::InProgress => l.in_progress += 1,
+                    Status::Pending | Status::NeedsFix => l.todo += 1,
+                    Status::Review => l.review += 1,
+                    Status::Blocked => l.blocked += 1,
+                    Status::Approved | Status::Done => {}
+                }
+            }
+            l
+        })
+        .collect();
+
+    LeadBriefing {
+        actionable: actionable.into_iter().map(|(_, _, i)| i).collect(),
+        awareness: awareness.into_iter().map(|(_, _, i)| i).collect(),
+        counts,
+        load,
+    }
+}
+
+// ---- Member briefing: bootstrap context, separate from the work queue ----
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueSummary {
+    pub actionable: usize,
+    pub awareness: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberBriefing {
+    pub team: String,
+    pub you: Member,
+    /// Names of members whose role is `lead`.
+    pub leads: Vec<String>,
+    pub roster: Vec<Member>,
+    /// Sizes only; fetch `task_briefing` for the items themselves.
+    pub queue: QueueSummary,
+    pub processes: Vec<ProcessEntry>,
+}
+
+/// `None` when there is no team or `member` is not on it.
+pub fn member_briefing(state: &State, member: &str) -> Option<MemberBriefing> {
+    let team = state.team.as_ref()?;
+    let you = team.members.iter().find(|m| m.name == member)?.clone();
+    let q = briefing(state, member);
+    Some(MemberBriefing {
+        team: team.name.clone(),
+        you,
+        leads: team
+            .members
+            .iter()
+            .filter(|m| m.role == "lead")
+            .map(|m| m.name.clone())
+            .collect(),
+        roster: team.members.clone(),
+        queue: QueueSummary {
+            actionable: q.actionable.len(),
+            awareness: q.awareness.len(),
+        },
+        processes: process_list(state),
+    })
 }
 
 // ---- Inbox: messages a member should see, after a cursor ----

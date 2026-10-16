@@ -122,6 +122,9 @@ name = "rteams-cli"
 version = "0.1.0"
 dependencies = [
  "rteams-server",
+ "rteams-store",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -139,8 +142,10 @@ name = "rteams-server"
 version = "0.1.0"
 dependencies = [
  "rteams-core",
+ "rteams-store",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

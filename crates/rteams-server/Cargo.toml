@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 rteams-core.workspace = true
+rteams-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

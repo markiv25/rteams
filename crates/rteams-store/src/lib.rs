@@ -17,7 +17,9 @@
 
 mod file;
 
-pub use file::{Executed, FileStore};
+pub use file::FileStore;
+
+use std::collections::HashMap;
 
 use rteams_core::{Command, CoreError, Event, MemStore, State};
 
@@ -40,22 +42,78 @@ pub enum StoreError {
     InvalidTeamName(String),
 }
 
+/// Result of an execute: the event, and whether it was already in the log (idempotent replay).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Executed {
+    pub event: Event,
+    pub replayed: bool,
+}
+
 /// What every backend gives callers: `execute` = decide, append, apply; reads see the full log.
 /// Reads take `&mut self` because a persistent store first catches up with other writers.
 pub trait Store {
-    fn execute(&mut self, actor: &str, ts: i64, cmd: Command) -> Result<Event, StoreError>;
+    /// Like `execute`, but a repeated `command_id` returns the original event instead of
+    /// appending a second one. `None` is a plain, non-idempotent execute.
+    fn execute_with_id(
+        &mut self,
+        actor: &str,
+        ts: i64,
+        command_id: Option<&str>,
+        cmd: Command,
+    ) -> Result<Executed, StoreError>;
+
+    fn execute(&mut self, actor: &str, ts: i64, cmd: Command) -> Result<Event, StoreError> {
+        Ok(self.execute_with_id(actor, ts, None, cmd)?.event)
+    }
+
     fn events(&mut self) -> Result<&[Event], StoreError>;
     fn state(&mut self) -> Result<&State, StoreError>;
 }
 
-impl Store for MemStore {
-    fn execute(&mut self, actor: &str, ts: i64, cmd: Command) -> Result<Event, StoreError> {
-        Ok(MemStore::execute(self, actor, ts, cmd)?.clone())
+/// In-process store: core's `MemStore` plus the same command-id dedup the file store has.
+/// For tests and ephemeral servers; nothing is shared or persisted.
+#[derive(Debug, Default)]
+pub struct MemoryStore {
+    mem: MemStore,
+    commands: HashMap<String, usize>,
+}
+
+impl MemoryStore {
+    pub fn new() -> Self {
+        Self::default()
     }
+}
+
+impl Store for MemoryStore {
+    fn execute_with_id(
+        &mut self,
+        actor: &str,
+        ts: i64,
+        command_id: Option<&str>,
+        cmd: Command,
+    ) -> Result<Executed, StoreError> {
+        if let Some(&i) = command_id.and_then(|id| self.commands.get(id)) {
+            return Ok(Executed {
+                event: self.mem.events()[i].clone(),
+                replayed: true,
+            });
+        }
+        let event = self.mem.execute(actor, ts, cmd)?.clone();
+        if let Some(id) = command_id {
+            self.commands
+                .insert(id.to_string(), self.mem.events().len() - 1);
+        }
+        Ok(Executed {
+            event,
+            replayed: false,
+        })
+    }
+
     fn events(&mut self) -> Result<&[Event], StoreError> {
-        Ok(MemStore::events(self))
+        Ok(self.mem.events())
     }
+
     fn state(&mut self) -> Result<&State, StoreError> {
-        Ok(MemStore::state(self))
+        Ok(self.mem.state())
     }
 }

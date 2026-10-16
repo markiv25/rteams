@@ -21,4 +21,5 @@ fs2 = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util"] }
 rteams-core = { path = "crates/rteams-core" }
+rteams-store = { path = "crates/rteams-store" }
 rteams-server = { path = "crates/rteams-server" }
