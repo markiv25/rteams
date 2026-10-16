@@ -41,6 +41,9 @@ pub enum StoreError {
     /// A caller-supplied guard (authorization policy) refused the command under the lock.
     #[error("forbidden: {0}")]
     Forbidden(String),
+    /// A write was attempted on a store opened with `open_read_only`.
+    #[error("store is read-only")]
+    ReadOnly,
     #[error("invalid team name {0:?}: use 1-64 chars of [A-Za-z0-9._-], not starting with '.'")]
     InvalidTeamName(String),
 }

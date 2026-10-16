@@ -7,11 +7,12 @@
 //! Stable signatures (echo/scout rely on them): `open`, `refresh`, `state`, `board`.
 //! Added: `seq`, `team_name`, `snapshot`, `task_detail`, `activity`.
 
+// The view API is ahead of its callers (echo/scout wire it in); drop this once they do.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 
-use rteams_core::{
-    kanban, Card, Event, EventKind, KanbanBoard, Scope, State, Status,
-};
+use rteams_core::{kanban, Card, Event, EventKind, KanbanBoard, Scope, State, Status};
 use rteams_store::FileStore;
 
 /// Read-only view of one team's log. Never appends.
@@ -61,7 +62,11 @@ impl Data {
     }
 
     pub fn team_name(&self) -> Option<String> {
-        self.store.loaded_state().team.as_ref().map(|t| t.name.clone())
+        self.store
+            .loaded_state()
+            .team
+            .as_ref()
+            .map(|t| t.name.clone())
     }
 
     /// Board with everything a card needs to render, plus the cursor it was built at.
@@ -301,8 +306,14 @@ fn summarize(k: &EventKind) -> String {
         }
         TaskBlocked { task, reason, .. } => format!("blocked {task}: {reason}"),
         TaskUnblocked { task, to } => format!("unblocked {task} -> {}", status_label(*to)),
-        TaskArchived { task, archived: true } => format!("archived {task}"),
-        TaskArchived { task, archived: false } => format!("restored {task}"),
+        TaskArchived {
+            task,
+            archived: true,
+        } => format!("archived {task}"),
+        TaskArchived {
+            task,
+            archived: false,
+        } => format!("restored {task}"),
         TaskCommented { task, text } => format!("commented on {task}: {}", clip(text)),
         ReviewRequested { task, reviewer } => format!("requested review of {task} from {reviewer}"),
         ReviewApproved { task, .. } => format!("approved {task}"),
@@ -365,6 +376,7 @@ mod tests {
             "lead",
             2,
             Command::CreateTask {
+                id: "T1".into(),
                 subject: "A".into(),
                 description: "d".into(),
                 owner: None,
@@ -377,6 +389,80 @@ mod tests {
         assert!(d.seq() > seq);
         assert_eq!(d.board().unwrap().todo.len(), 1);
         assert!(!d.refresh().unwrap());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn task(id: &str, deps: &[&str]) -> Command {
+        Command::CreateTask {
+            id: id.into(),
+            subject: format!("subject {id}"),
+            description: format!("desc {id}"),
+            owner: Some("vector".into()),
+            blocked_by: deps.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn snapshot_detail_and_activity_render_the_log() {
+        let home = tmp("views");
+        let mut w = create_team(&home);
+        w.execute(
+            "lead",
+            2,
+            Command::AddMember {
+                name: "vector".into(),
+                role: "dev".into(),
+            },
+        )
+        .unwrap();
+        w.execute("lead", 3, task("T1", &[])).unwrap();
+        w.execute("lead", 4, task("T2", &["T1"])).unwrap();
+        w.execute(
+            "vector",
+            5,
+            Command::Comment {
+                task: "T1".into(),
+                text: "hello\nworld".into(),
+            },
+        )
+        .unwrap();
+        w.execute(
+            "vector",
+            6,
+            Command::Transition {
+                task: "T1".into(),
+                to: Status::InProgress,
+            },
+        )
+        .unwrap();
+        let mut d = Data::open(home.clone(), "t").unwrap();
+        d.refresh().unwrap();
+
+        let snap = d.snapshot();
+        assert_eq!(snap.team.as_deref(), Some("t"));
+        assert_eq!(snap.seq, d.seq());
+        assert_eq!(snap.columns.len(), 5);
+        assert_eq!(snap.columns[0].cards[0].id, "T2");
+        assert_eq!(snap.columns[0].cards[0].waiting_on, vec!["T1"]);
+        assert_eq!(snap.columns[1].cards[0].id, "T1");
+        assert_eq!(snap.columns[1].cards[0].owner.as_deref(), Some("vector"));
+
+        let t1 = d.task_detail("T1").unwrap();
+        assert_eq!(t1.description, "desc T1");
+        assert_eq!(t1.blocks, vec!["T2"]);
+        assert_eq!(t1.comments.len(), 1);
+        assert_eq!(t1.comments[0].text, "hello\nworld");
+        assert_eq!(t1.history.len(), 3, "created, commented, transitioned");
+        let t2 = d.task_detail("T2").unwrap();
+        assert_eq!(t2.waiting_on, vec!["T1"]);
+        assert!(d.task_detail("nope").is_none());
+
+        let a = d.activity(2);
+        assert_eq!(a.len(), 2);
+        assert!(a[0].seq > a[1].seq, "newest first");
+        assert_eq!(a[0].task.as_deref(), Some("T1"));
+        assert!(a[0].summary.contains("in progress"));
+        assert!(a[1].summary.ends_with('…'), "multi-line comment is clipped");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

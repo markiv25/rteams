@@ -22,7 +22,8 @@ struct Line {
 pub struct FileStore {
     dir: PathBuf,
     log_path: PathBuf,
-    lock_file: File,
+    /// `None` for a read-only store: it never locks, appends or repairs.
+    lock_file: Option<File>,
     events: Vec<Event>,
     state: State,
     /// command_id -> index into `events`.
@@ -81,7 +82,7 @@ impl FileStore {
         let mut store = FileStore {
             dir,
             log_path,
-            lock_file,
+            lock_file: Some(lock_file),
             events: Vec::new(),
             state: State::default(),
             commands: HashMap::new(),
@@ -89,6 +90,40 @@ impl FileStore {
         };
         store.refresh()?;
         Ok(store)
+    }
+
+    /// Open an existing team's log for reading only. Creates nothing (no directory, log or
+    /// lock file), never repairs a torn tail, and refuses every write with `ReadOnly`.
+    /// A missing team is an `Io` error with `ErrorKind::NotFound`.
+    pub fn open_read_only(root: impl AsRef<Path>, team: &str) -> Result<Self, StoreError> {
+        if !valid_team_name(team) {
+            return Err(StoreError::InvalidTeamName(team.to_string()));
+        }
+        let dir = root.as_ref().join(team);
+        let log_path = dir.join("events.jsonl");
+        File::open(&log_path).map_err(io(&log_path))?;
+        let mut store = FileStore {
+            dir,
+            log_path,
+            lock_file: None,
+            events: Vec::new(),
+            state: State::default(),
+            commands: HashMap::new(),
+            offset: 0,
+        };
+        store.refresh()?;
+        Ok(store)
+    }
+
+    /// Events folded in so far, without catching up first. With `refresh()` this gives a
+    /// consistent view that only moves when the caller says so (e.g. a UI frame).
+    pub fn loaded_events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// State folded in so far, without catching up first.
+    pub fn loaded_state(&self) -> &State {
+        &self.state
     }
 
     pub fn dir(&self) -> &Path {
@@ -109,9 +144,12 @@ impl FileStore {
         cmd: Command,
         guard: &dyn Fn(&State) -> Result<(), String>,
     ) -> Result<Executed, StoreError> {
+        let Some(lock) = &self.lock_file else {
+            return Err(StoreError::ReadOnly);
+        };
         let lock_path = self.dir.join(".lock");
-        self.lock_file.lock_exclusive().map_err(io(&lock_path))?;
-        let lock_file = self.lock_file.try_clone().map_err(io(&lock_path))?;
+        lock.lock_exclusive().map_err(io(&lock_path))?;
+        let lock_file = lock.try_clone().map_err(io(&lock_path))?;
         let _guard = Unlock(&lock_file);
 
         self.catch_up(true)?;
@@ -159,6 +197,9 @@ impl FileStore {
 
     /// Regenerate every task snapshot from the current state (e.g. after copying a log in).
     pub fn rewrite_snapshots(&mut self) -> Result<(), StoreError> {
+        if self.lock_file.is_none() {
+            return Err(StoreError::ReadOnly);
+        }
         self.refresh()?;
         let ids: Vec<String> = self.state.tasks.iter().map(|t| t.id.clone()).collect();
         for id in ids {

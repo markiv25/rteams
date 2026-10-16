@@ -535,3 +535,82 @@ fn memory_store_dedups_command_ids_like_file_store() {
         Err(StoreError::Core(CoreError::TaskExists(_)))
     ));
 }
+
+#[test]
+fn read_only_open_creates_nothing_and_missing_team_is_not_found() {
+    let dir = TempDir::new().unwrap();
+    let err = FileStore::open_read_only(dir.path(), "ghost")
+        .err()
+        .expect("no such team");
+    match err {
+        StoreError::Io { source, .. } => assert_eq!(source.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected Io NotFound, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "nothing created"
+    );
+    assert!(matches!(
+        FileStore::open_read_only(dir.path(), "../x").err(),
+        Some(StoreError::InvalidTeamName(_))
+    ));
+}
+
+#[test]
+fn read_only_tails_a_writer_and_only_moves_on_refresh() {
+    let dir = TempDir::new().unwrap();
+    let mut writer = FileStore::open(dir.path(), "t").unwrap();
+    setup(&mut writer);
+    let mut reader = FileStore::open_read_only(dir.path(), "t").unwrap();
+    let base = reader.loaded_events().len();
+    assert_eq!(base, 4);
+
+    for (actor, cmd) in script() {
+        writer.execute(actor, 3, cmd).unwrap();
+    }
+    // Loaded view is stable until the caller refreshes.
+    assert_eq!(reader.loaded_events().len(), base);
+    reader.refresh().unwrap();
+    assert_eq!(reader.loaded_events().len(), writer.events().unwrap().len());
+    assert_eq!(
+        kanban(reader.loaded_state()),
+        kanban(writer.state().unwrap())
+    );
+}
+
+#[test]
+fn read_only_refuses_writes_and_leaves_a_torn_tail_alone() {
+    let dir = TempDir::new().unwrap();
+    {
+        let mut w = FileStore::open(dir.path(), "t").unwrap();
+        setup(&mut w);
+    }
+    let log = dir.path().join("t/events.jsonl");
+    OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"{\"seq\":5,\"ts\"")
+        .unwrap();
+    let before = std::fs::read(&log).unwrap();
+
+    let mut r = FileStore::open_read_only(dir.path(), "t").unwrap();
+    assert_eq!(r.loaded_events().len(), 4, "torn tail ignored");
+    let err = r
+        .execute(
+            "lead",
+            9,
+            Command::CreateTask {
+                id: "x".into(),
+                subject: "x".into(),
+                description: String::new(),
+                owner: None,
+                blocked_by: vec![],
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ReadOnly));
+    assert!(matches!(r.rewrite_snapshots(), Err(StoreError::ReadOnly)));
+    assert_eq!(std::fs::read(&log).unwrap(), before, "log untouched");
+}
