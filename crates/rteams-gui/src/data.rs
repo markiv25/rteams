@@ -4,15 +4,12 @@
 //! log: call `refresh()` on a poll, then read. Reads use what the last `refresh()` loaded, so a
 //! frame sees one consistent view. Everything returned is a plain, owned, renderable struct.
 //!
-//! Stable signatures (echo/scout rely on them): `open`, `refresh`, `state`, `board`.
+//! Stable signatures (echo/scout rely on them): `open`, `refresh`, `state`.
 //! Added: `seq`, `team_name`, `snapshot`, `task_detail`, `activity`.
-
-// The view API is ahead of its callers (echo/scout wire it in); drop this once they do.
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 
-use rteams_core::{kanban, Card, Event, EventKind, KanbanBoard, Scope, State, Status};
+use rteams_core::{kanban, Card, Event, EventKind, Scope, State, Status};
 use rteams_store::FileStore;
 
 /// Read-only view of one team's log. Never appends.
@@ -54,11 +51,6 @@ impl Data {
     /// Current state as of the last `refresh`.
     pub fn state(&mut self) -> Result<&State, String> {
         Ok(self.store.loaded_state())
-    }
-
-    /// Kanban projection (archived tasks hidden) as of the last `refresh`.
-    pub fn board(&mut self) -> Result<KanbanBoard, String> {
-        Ok(kanban(self.store.loaded_state()))
     }
 
     pub fn team_name(&self) -> Option<String> {
@@ -387,7 +379,7 @@ mod tests {
         assert_eq!(d.seq(), seq, "reads only move on refresh");
         assert!(d.refresh().unwrap());
         assert!(d.seq() > seq);
-        assert_eq!(d.board().unwrap().todo.len(), 1);
+        assert_eq!(d.snapshot().columns[0].cards.len(), 1);
         assert!(!d.refresh().unwrap());
         let _ = std::fs::remove_dir_all(&home);
     }

@@ -1,27 +1,22 @@
-//! The kanban board: five columns of cards. Pure rendering over a `KanbanBoard`.
+//! The kanban board: five columns of cards. Pure rendering over a `BoardSnapshot`.
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
-use rteams_core::{Card, KanbanBoard, Status};
+use rteams_core::Status;
+
+use crate::data::{BoardSnapshot, CardView};
 
 /// Draw the board; clicking a card sets `selected` to its task id.
-pub fn show(ui: &mut egui::Ui, board: &KanbanBoard, selected: &mut Option<String>) {
-    let columns: [(&str, &[Card]); 5] = [
-        ("Todo", &board.todo),
-        ("In Progress", &board.in_progress),
-        ("Review", &board.review),
-        ("Approved", &board.approved),
-        ("Done", &board.done),
-    ];
-    ui.columns(columns.len(), |cols| {
-        for (ui, (title, cards)) in cols.iter_mut().zip(columns) {
+pub fn show(ui: &mut egui::Ui, board: &BoardSnapshot, selected: &mut Option<String>) {
+    ui.columns(board.columns.len(), |cols| {
+        for (ui, col) in cols.iter_mut().zip(&board.columns) {
             ui.vertical(|ui| {
-                ui.heading(format!("{title} ({})", cards.len()));
+                ui.heading(format!("{} ({})", col.name, col.cards.len()));
                 ui.separator();
                 egui::ScrollArea::vertical()
-                    .id_salt(title)
+                    .id_salt(col.name)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for card in cards {
+                        for card in &col.cards {
                             card_ui(ui, card, selected);
                         }
                     });
@@ -30,7 +25,7 @@ pub fn show(ui: &mut egui::Ui, board: &KanbanBoard, selected: &mut Option<String
     });
 }
 
-fn card_ui(ui: &mut egui::Ui, card: &Card, selected: &mut Option<String>) {
+fn card_ui(ui: &mut egui::Ui, card: &CardView, selected: &mut Option<String>) {
     let is_selected = selected.as_deref() == Some(card.id.as_str());
     let stroke = if is_selected {
         Stroke::new(2.0, ui.visuals().selection.stroke.color)
@@ -50,6 +45,10 @@ fn card_ui(ui: &mut egui::Ui, card: &Card, selected: &mut Option<String>) {
                 Some(o) => o.as_str(),
                 None => "unassigned",
             });
+            if !card.waiting_on.is_empty() {
+                let ids: Vec<String> = card.waiting_on.iter().map(|d| short_id(d)).collect();
+                ui.weak(format!("waiting on {}", ids.join(", ")));
+            }
         })
         .response
         .interact(Sense::click());

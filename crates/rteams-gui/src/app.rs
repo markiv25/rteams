@@ -56,11 +56,8 @@ impl eframe::App for App {
             self.selected = None;
         }
 
-        let board_result = data.board();
-        let title = data
-            .state()
-            .ok()
-            .and_then(|s| s.team.as_ref().map(|t| t.name.clone()));
+        let snapshot = data.snapshot();
+        let title = snapshot.team.clone();
 
         if let Some(name) = &title {
             let wanted = window_title(name);
@@ -73,10 +70,20 @@ impl eframe::App for App {
         egui::Panel::top("header").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(title.as_deref().unwrap_or("(no team yet)"));
-                if let Some(e) = self.error.as_ref().or(board_result.as_ref().err()) {
+                if let Some(e) = &self.error {
                     ui.colored_label(egui::Color32::LIGHT_RED, e);
                 }
             });
+        });
+
+        egui::Panel::bottom("activity").show(ui, |ui| {
+            let items = data.activity(3);
+            if items.is_empty() {
+                ui.weak("no activity yet");
+            }
+            for a in items {
+                ui.weak(format!("#{} {}: {}", a.seq, a.actor, a.summary));
+            }
         });
 
         if let Some(id) = self.selected.clone() {
@@ -104,9 +111,7 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Ok(b) = &board_result {
-                board::show(ui, b, &mut self.selected);
-            }
+            board::show(ui, &snapshot, &mut self.selected);
         });
     }
 }
