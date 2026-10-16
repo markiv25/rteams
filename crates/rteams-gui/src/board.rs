@@ -73,7 +73,7 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-fn status_style(s: Status) -> (&'static str, Color32) {
+pub(crate) fn status_style(s: Status) -> (&'static str, Color32) {
     match s {
         Status::Pending => ("pending", Color32::from_rgb(190, 190, 190)),
         Status::InProgress => ("in progress", Color32::from_rgb(120, 170, 255)),

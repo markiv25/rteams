@@ -83,9 +83,16 @@ impl eframe::App for App {
             egui::Panel::right("detail")
                 .default_size(360.0)
                 .show(ui, |ui| {
+                    let detail_view = data.task_detail(&id);
                     if let Ok(state) = data.state() {
                         let action = egui::ScrollArea::vertical()
-                            .show(ui, |ui| detail::show(ui, state, &id))
+                            .show(ui, |ui| {
+                                let action = detail::show(ui, state, &id);
+                                if let Some(d) = &detail_view {
+                                    detail::history(ui, &d.history);
+                                }
+                                action
+                            })
                             .inner;
                         match action {
                             DetailAction::None => {}
