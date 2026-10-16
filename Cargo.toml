@@ -6,6 +6,7 @@ members = [
     "crates/rteams-server",
     "crates/rteams-tui",
     "crates/rteams-cli",
+    "crates/rteams-gui",
 ]
 
 [workspace.package]
