@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use eframe::egui;
 
+use crate::board;
 use crate::data::Data;
-use crate::{board, detail};
+use crate::detail::{self, DetailAction};
 
 /// How often the log is checked for new events. Cheap: it is one `read` past the last offset.
 const POLL: Duration = Duration::from_millis(500);
@@ -67,14 +68,15 @@ impl eframe::App for App {
             egui::Panel::right("detail")
                 .default_size(360.0)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("Close").clicked() {
-                            self.selected = None;
-                        }
-                    });
-                    ui.separator();
                     if let Ok(state) = data.state() {
-                        egui::ScrollArea::vertical().show(ui, |ui| detail::show(ui, state, &id));
+                        let action = egui::ScrollArea::vertical()
+                            .show(ui, |ui| detail::show(ui, state, &id))
+                            .inner;
+                        match action {
+                            DetailAction::None => {}
+                            DetailAction::Close => self.selected = None,
+                            DetailAction::OpenTask(t) => self.selected = Some(t),
+                        }
                     }
                 });
         }
