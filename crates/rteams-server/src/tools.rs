@@ -351,6 +351,14 @@ fn review(
     who: &str,
     expected: impl Fn(&Task) -> Option<String>,
 ) -> Result<Value, ToolError> {
+    // A retried command_id replays its original result: the dry run below would otherwise
+    // judge it against state the first attempt already changed.
+    if let Some(ev) = cid
+        .and_then(|id| store.replay(id).transpose())
+        .transpose()?
+    {
+        return task_reply(store, ev.seq, task);
+    }
     let state = store.state()?;
     let t = state
         .task(task)

@@ -272,6 +272,14 @@ impl Store for FileStore {
         self.write(actor, ts, command_id, cmd)
     }
 
+    fn replay(&mut self, command_id: &str) -> Result<Option<Event>, StoreError> {
+        self.refresh()?;
+        Ok(self
+            .commands
+            .get(command_id)
+            .map(|&i| self.events[i].clone()))
+    }
+
     fn events(&mut self) -> Result<&[Event], StoreError> {
         self.refresh()?;
         Ok(&self.events)

@@ -49,3 +49,31 @@ fn corrupt_log_surfaces_as_store_error_tool_result() {
     let err = call(&s, "task_list", json!({})).unwrap_err();
     assert_eq!(err["code"], "store_error");
 }
+
+#[test]
+fn retried_command_id_replays_for_policy_checked_tools_across_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Server::with_store(FileStore::open(dir.path(), "t").unwrap());
+    let b = Server::with_store(FileStore::open(dir.path(), "t").unwrap());
+    call(
+        &a,
+        "team_create",
+        json!({ "name": "t", "actor": "team-lead", "members": [{ "name": "echo", "role": "developer" }] }),
+    )
+    .unwrap();
+    let made = call(
+        &a,
+        "task_create",
+        json!({ "actor": "team-lead", "subject": "x", "owner": "echo" }),
+    )
+    .unwrap();
+    let id = made["task"]["id"].as_str().unwrap().to_string();
+
+    let args = json!({ "task": id, "actor": "echo", "command_id": "start-1" });
+    let first = call(&a, "task_start", args.clone()).unwrap();
+    // The task is already in_progress; a plain repeat is illegal, a retry with the id replays.
+    let retry = call(&b, "task_start", args).unwrap();
+    assert_eq!(first["event_seq"], retry["event_seq"]);
+    let plain = call(&b, "task_start", json!({ "task": id, "actor": "echo" })).unwrap_err();
+    assert_eq!(plain["code"], "illegal_transition");
+}
