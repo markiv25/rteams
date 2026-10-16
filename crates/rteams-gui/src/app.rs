@@ -17,6 +17,12 @@ pub struct App {
     /// Last refresh error, shown in the header; the previous board stays on screen.
     error: Option<String>,
     selected: Option<String>,
+    /// Title last sent to the window, so it is only updated when the team name changes.
+    window_title: String,
+}
+
+pub fn window_title(team: &str) -> String {
+    format!("rteams \u{2014} {team}")
 }
 
 impl App {
@@ -25,6 +31,7 @@ impl App {
             data: Data::open(home, &team),
             error: None,
             selected: None,
+            window_title: window_title(&team),
         }
     }
 }
@@ -54,6 +61,14 @@ impl eframe::App for App {
             .state()
             .ok()
             .and_then(|s| s.team.as_ref().map(|t| t.name.clone()));
+
+        if let Some(name) = &title {
+            let wanted = window_title(name);
+            if wanted != self.window_title {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(wanted.clone()));
+                self.window_title = wanted;
+            }
+        }
 
         egui::Panel::top("header").show(ui, |ui| {
             ui.horizontal(|ui| {

@@ -75,6 +75,25 @@ Flags win over environment variables. Every agent that should see the same board
 same home and team. Writes take a file lock, catch up with other processes, then validate against
 the latest state, so concurrent agents are safe.
 
+## Visual board (rteams-gui)
+
+`rteams-gui` opens a native window with the live kanban board (Todo / In Progress / Review /
+Approved / Done). It is read-only and reads the same `RTEAMS_HOME` the MCP server writes, so
+cards move as agents work (it polls the log every 500 ms). Click a card for its details; `Esc`
+closes the panel.
+
+```sh
+# from the repo, with some state already in /tmp/rteams-demo:
+cargo run -p rteams-gui -- --home /tmp/rteams-demo --team demo
+
+# or build once and run the binary (target/release/rteams-gui, ~6.6 MB):
+cargo build --release -p rteams-gui
+./target/release/rteams-gui --home /tmp/rteams-demo --team demo
+```
+
+Flags: `--home DIR` (env `RTEAMS_HOME`, required) and `--team NAME` (env `RTEAMS_TEAM`, default
+`default`), the same as the server. Point it at the home your agents use and you see their board.
+
 ## Things to know when calling the tools
 
 - **`actor` is explicit.** The server has no login: write tools take `actor` (your member name)

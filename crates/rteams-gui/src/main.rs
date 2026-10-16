@@ -56,7 +56,7 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         }
     };
-    let title = format!("rteams: {}", cfg.team);
+    let title = app::window_title(&cfg.team);
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(title.clone())
