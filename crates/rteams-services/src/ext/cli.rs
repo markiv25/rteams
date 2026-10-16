@@ -141,6 +141,13 @@ pub fn run(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // Own process group, so a timeout also kills children a shell script started: they
+    // inherit the output pipes and would otherwise keep them open after the shell dies.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -158,7 +165,7 @@ pub fn run(
             Ok(Some(st)) => break (Some(st), false),
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(10)),
             _ => {
-                let _ = child.kill();
+                kill_group(&mut child);
                 let _ = child.wait();
                 break (None, true);
             }
@@ -171,6 +178,19 @@ pub fn run(
         stderr: grab(err_rx),
         timed_out,
     }
+}
+
+/// Kill `child` and its process group (see `run`); a plain kill elsewhere.
+pub(crate) fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 /// `run` taking `&str` args.
@@ -243,7 +263,8 @@ mod tests {
     #[test]
     fn times_out_and_kills() {
         let d = tempfile::tempdir().unwrap();
-        let s = script(d.path(), "slow.sh", "sleep 5");
+        // `; true` keeps the shell from exec-ing sleep, so a child holds the pipes open.
+        let s = script(d.path(), "slow.sh", "sleep 5; true");
         let t = Instant::now();
         let o = run_str(&s, &[], None, &[], Duration::from_millis(200));
         assert!(o.timed_out && !o.ok);

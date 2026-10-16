@@ -113,6 +113,11 @@ pub fn check_stdio(
     if let Some(c) = cwd {
         cmd.current_dir(c);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -176,9 +181,12 @@ pub fn check_stdio(
         }
     };
 
+    // Called after the child is killed: read until the stderr reader hits EOF (it drops `etx`)
+    // so a crash message is not lost to the race with the stdout reader.
     let stderr_tail = || {
         let mut last = String::new();
-        while let Ok(t) = erx.try_recv() {
+        let until = Instant::now() + Duration::from_millis(500);
+        while let Ok(t) = erx.recv_timeout(until.saturating_duration_since(Instant::now())) {
             last = t;
         }
         last.trim().to_string()
@@ -222,7 +230,7 @@ pub fn check_stdio(
     })();
 
     drop(stdin);
-    let _ = child.kill();
+    super::cli::kill_group(&mut child);
     let _ = child.wait();
 
     match result {
