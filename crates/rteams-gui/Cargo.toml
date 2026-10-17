@@ -18,7 +18,8 @@ egui_extras = { version = "0.37", default-features = false, features = ["syntect
 rfd = "0.15"
 open = "5"
 ctrlc = { version = "3", features = ["termination"] }
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+# `clipboard`: Cmd/Ctrl+C, X and V (paste into the chat composer, copy a message).
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard"] }
 # Icon glyphs (people, chat, folder, play/stop...) live in egui's emoji fonts.
 egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
