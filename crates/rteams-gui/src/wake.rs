@@ -279,6 +279,7 @@ fn build_prompt_after(
                 ));
             }
         }
+        let mut cut = false;
         if !msgs.is_empty() {
             s.push_str("Unread messages:\n");
             for m in msgs {
@@ -287,8 +288,14 @@ fn build_prompt_after(
                 } else {
                     ""
                 };
-                s.push_str(&format!("- {}{kind}: {}\n", m.from, clip(&m.text, c)));
+                let shown = clip(&m.text, c);
+                cut |= shown.ends_with('…');
+                s.push_str(&format!("- {}{kind}: {}\n", m.from, shown));
             }
+        }
+        if cut {
+            // A long request clipped to a line would read as the whole request.
+            s.push_str("Messages ending in … are cut short: read them in full with inbox_get.\n");
         }
         s.push_str(
             "This is everything you need — skip member_briefing/task_briefing unless something is unclear.",
@@ -538,6 +545,15 @@ mod tests {
         assert!(p.contains("broadcast hello"));
         assert!(p.contains("Mode: urgent"));
         assert!(p.contains("skip member_briefing/task_briefing"));
+        assert!(p.contains("read them in full with inbox_get"));
         assert!(p.len() < 1500, "{} bytes\n{p}", p.len());
+        let short = build_prompt(&st_short(), "bob", &[], None);
+        assert!(!short.contains("inbox_get"), "{short}");
+    }
+
+    fn st_short() -> State {
+        let mut evs = base();
+        evs.push(dm(20, "alice", Some("bob"), "short note"));
+        State::from_events(&evs)
     }
 }

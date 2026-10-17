@@ -206,6 +206,15 @@ fn system_prompt(spec: &AgentSpec) -> String {
             "\nYou are the only agent on this team: own every task on the board yourself; \
              create tasks for multi-step work.",
         );
+    } else if spec.role == "lead" {
+        s.push_str(
+            "\nYOU LEAD THIS TEAM (overrides rules 1, 3 and 4): when a message gives you work, act \
+             on it even with no task. Read the full request, break it into rteams tasks \
+             (task_create, task_set_dependencies), assign each to the best-fitting member from \
+             team_get, then send the requester ONE short message listing the tasks and owners. \
+             Review work sent to you (review_approve / review_request_changes). Do work yourself \
+             only when no member fits it.",
+        );
     }
     match spec.mode {
         Mode::Do => {}
@@ -1462,6 +1471,18 @@ echo oops >&2"#;
             "You are the only agent on this team: own every task on the board yourself; \
              create tasks for multi-step work."
         ));
+    }
+
+    #[test]
+    fn lead_agent_prompt() {
+        let mut s = spec(Path::new("/w"), "a");
+        assert!(!system_prompt(&s).contains("YOU LEAD THIS TEAM"));
+        s.role = "lead".into();
+        let p = system_prompt(&s);
+        assert!(p.contains("YOU LEAD THIS TEAM") && p.contains("assign each"));
+        // A solo agent does everything itself, lead or not.
+        s.solo = true;
+        assert!(!system_prompt(&s).contains("YOU LEAD THIS TEAM"));
     }
 
     #[test]

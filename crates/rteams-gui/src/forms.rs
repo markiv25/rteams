@@ -8,7 +8,7 @@ use crate::actions::GuiCmd;
 use crate::theme;
 use crate::view::{Intent, Intents};
 
-const ROLES: [&str; 5] = ["developer", "reviewer", "designer", "qa", "devops"];
+const ROLES: [&str; 6] = ["lead", "developer", "reviewer", "designer", "qa", "devops"];
 
 /// `true` when `name` can be added: non-empty and without whitespace.
 pub fn valid_member_name(name: &str) -> bool {

@@ -479,10 +479,12 @@ impl App {
         let workdir = project
             .clone()
             .unwrap_or_else(|| self.workdir.trim().into());
+        // Agents that run: everyone but the human (an AI lead counts).
+        let me = self.actor();
         let agents = team
             .members
             .iter()
-            .filter(|x| !x.removed && x.role != "lead")
+            .filter(|x| !x.removed && Some(&x.name) != me.as_ref())
             .count();
         let spec = AgentSpec {
             member: member.to_string(),
