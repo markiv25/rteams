@@ -83,7 +83,7 @@ impl AgentRuntime for Claude {
         "npm install -g @anthropic-ai/claude-code   (or: curl -fsSL https://claude.ai/install.sh | bash)"
     }
     fn build_command(&self, ctx: &LaunchCtx) -> Command {
-        let mcp = serde_json::json!({ "mcpServers": { "rteams": mcp_server_entry(ctx, false) } });
+        let mcp = mcp_doc(ctx, false);
         let mut c = base_command(ctx);
         c.arg("-p")
             .arg(&ctx.prompt)
@@ -104,6 +104,16 @@ impl AgentRuntime for Claude {
         if let Some(r) = ctx.resume.as_deref().filter(|r| !r.is_empty()) {
             c.arg("--resume").arg(r);
         }
+        if let Some(e) = ctx
+            .effort
+            .as_deref()
+            .filter(|e| matches!(*e, "low" | "medium" | "high" | "xhigh" | "max"))
+        {
+            c.arg("--effort").arg(e);
+        }
+        if ctx.fast {
+            c.arg("--settings").arg(r#"{"fastMode":true}"#);
+        }
         match ctx.permissions.as_str() {
             "skip" => {
                 c.arg("--dangerously-skip-permissions");
@@ -119,8 +129,13 @@ impl AgentRuntime for Claude {
         if read_only_mode(ctx) {
             c.arg("--disallowedTools=Edit,Write,NotebookEdit,Bash");
         }
-        if ctx.mode == "delegate" {
-            c.arg("--allowedTools=mcp__rteams");
+        if ctx.mode == "delegate" || !ctx.extra_mcp.is_empty() {
+            let mut allow = String::from("mcp__rteams");
+            for (n, _) in ctx.extra_mcp.iter().filter(|(n, _)| n != "rteams") {
+                allow.push_str(",mcp__");
+                allow.push_str(n);
+            }
+            c.arg(format!("--allowedTools={allow}"));
         }
         c
     }
@@ -133,6 +148,9 @@ impl AgentRuntime for Claude {
             Some("system") | Some("result") => session_field(&v),
             _ => None,
         }
+    }
+    fn login_command(&self) -> Option<&'static str> {
+        Some("claude auth login")
     }
     fn supports_resume(&self) -> bool {
         true

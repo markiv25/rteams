@@ -23,6 +23,7 @@ use rteams_services::sessions::worktrees::{group_by_repo, RepoGroup};
 use crate::theme;
 use crate::ui::{FeatureCtx, Screen, ShellRequest, TabId};
 
+pub mod context_tab;
 pub mod project_list;
 pub mod report_tab;
 pub mod search_bar;
@@ -178,6 +179,7 @@ pub enum ViewerTab {
     Conversation,
     Waterfall,
     Report,
+    Context,
 }
 
 pub struct SessionsScreen {
@@ -197,6 +199,7 @@ pub struct SessionsScreen {
     load_error: Option<String>,
     viewer: viewer::ViewerState,
     tab: ViewerTab,
+    context: Option<context_tab::ContextData>,
     search: search_bar::SearchState,
     search_job: Option<SearchJob>,
     search_wake: Arc<Mutex<bool>>,
@@ -234,6 +237,7 @@ impl SessionsScreen {
             load_error: None,
             viewer: Default::default(),
             tab: ViewerTab::Conversation,
+            context: None,
             search: Default::default(),
             search_job: None,
             search_wake: Arc::default(),
@@ -385,6 +389,23 @@ impl SessionsScreen {
             list.remove(i);
         } else {
             list.push(id.to_string());
+        }
+        let _ = cfg.save(home);
+        self.cfg = cfg;
+    }
+
+    /// Hide (`hide`) or unhide every session in the current list at once.
+    fn set_hidden_bulk(&mut self, home: &std::path::Path, ids: &[String], hide: bool) {
+        let mut cfg = AppConfig::load(home);
+        for id in ids {
+            let pos = cfg.hidden_sessions.iter().position(|x| x == id);
+            match (hide, pos) {
+                (true, None) => cfg.hidden_sessions.push(id.clone()),
+                (false, Some(i)) => {
+                    cfg.hidden_sessions.remove(i);
+                }
+                _ => {}
+            }
         }
         let _ = cfg.save(home);
         self.cfg = cfg;
@@ -558,6 +579,7 @@ impl SessionsScreen {
                 ),
                 (ViewerTab::Waterfall, "sessions.tab.waterfall", "Waterfall"),
                 (ViewerTab::Report, "sessions.tab.report", "Session report"),
+                (ViewerTab::Context, "sessions.tab.context", "Context"),
             ] {
                 if ui
                     .selectable_label(self.tab == tab, tt(tr, key, d))
@@ -613,6 +635,26 @@ impl SessionsScreen {
                 }
             }
             ViewerTab::Report => copy = report_tab::show(ui, tr, &l.report),
+            ViewerTab::Context => {
+                if self.context.as_ref().map(|d| d.session_id.as_str())
+                    != Some(l.session.id.as_str())
+                {
+                    let ov = self
+                        .cfg
+                        .extra
+                        .get("claude_root_override")
+                        .and_then(|v| v.as_str());
+                    let base = rteams_services::claude_root::resolve_system(ov).path;
+                    self.context = Some(context_tab::build(
+                        &l.session,
+                        &base,
+                        rteams_services::trust::claude_json_path().as_deref(),
+                    ));
+                }
+                if let Some(d) = &self.context {
+                    context_tab::show(ui, tr, d);
+                }
+            }
         }
         if copy {
             ui.ctx().copy_text(report::to_markdown(&l.report));
@@ -811,6 +853,11 @@ impl Screen for SessionsScreen {
                 ListAction::Select(id) => self.select_session(&ctx, &id),
                 ListAction::TogglePin(id) => self.toggle_list(c.home, &id, true),
                 ListAction::ToggleHide(id) => self.toggle_list(c.home, &id, false),
+                ListAction::SetHiddenAll(hide) => {
+                    let ids: Vec<String> =
+                        self.display_list().iter().map(|s| s.id.clone()).collect();
+                    self.set_hidden_bulk(c.home, &ids, hide);
+                }
             }
         }
         let _ = self.scan_error_free;
@@ -927,6 +974,7 @@ mod tests {
             ViewerTab::Conversation,
             ViewerTab::Waterfall,
             ViewerTab::Report,
+            ViewerTab::Context,
         ] {
             s.tab = tab;
             frame(&mut s, &home, &tr);
@@ -959,6 +1007,24 @@ mod tests {
         s.toggle_list(&home, "s2", false);
         assert!(AppConfig::load(&home).hidden_sessions.is_empty());
         frame(&mut s, &home, &tr);
+    }
+
+    #[test]
+    fn bulk_hide_and_unhide_persist() {
+        let (d, home) = fixture();
+        let tr = I18n::default();
+        let mut s = SessionsScreen::with_dirs(Some(d.path().join("claude")), None);
+        frame(&mut s, &home, &tr);
+        settle(&mut s, &home, &tr, |s| s.scanned.is_some());
+        let ids: Vec<String> = s.display_list().iter().map(|m| m.id.clone()).collect();
+        assert_eq!(ids.len(), 2);
+        s.set_hidden_bulk(&home, &ids, true);
+        assert_eq!(AppConfig::load(&home).hidden_sessions.len(), 2);
+        assert!(s.display_list().is_empty());
+        s.set_hidden_bulk(&home, &ids, true);
+        assert_eq!(AppConfig::load(&home).hidden_sessions.len(), 2, "no dupes");
+        s.set_hidden_bulk(&home, &ids, false);
+        assert!(AppConfig::load(&home).hidden_sessions.is_empty());
     }
 
     #[test]

@@ -115,6 +115,25 @@ impl FileStore {
         Ok(store)
     }
 
+    /// Permanently remove a team's directory (the original's "permanently delete" and "delete
+    /// draft"). Only a soft-deleted team, or a draft that never got a `TeamCreated`, may go;
+    /// anything live is refused with `Forbidden`. Irreversible.
+    pub fn delete_team_permanently(root: impl AsRef<Path>, team: &str) -> Result<(), StoreError> {
+        if !valid_team_name(team) {
+            return Err(StoreError::InvalidTeamName(team.to_string()));
+        }
+        let dir = root.as_ref().join(team);
+        if dir.join("events.jsonl").exists() {
+            let store = Self::open_read_only(root.as_ref(), team)?;
+            if store.state.team.as_ref().is_some_and(|t| !t.deleted) {
+                return Err(StoreError::Forbidden(
+                    "team is not in the trash; delete it first".to_string(),
+                ));
+            }
+        }
+        fs::remove_dir_all(&dir).map_err(io(&dir))
+    }
+
     /// Events folded in so far, without catching up first. With `refresh()` this gives a
     /// consistent view that only moves when the caller says so (e.g. a UI frame).
     pub fn loaded_events(&self) -> &[Event] {
@@ -304,6 +323,16 @@ impl FileStore {
 }
 
 impl Store for FileStore {
+    fn team_dir(&self) -> Option<String> {
+        self.dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+
+    fn home(&self) -> Option<std::path::PathBuf> {
+        self.dir.parent().map(std::path::Path::to_path_buf)
+    }
+
     /// The id is persisted on the same log line as the event, so dedup and append are atomic.
     fn execute_guarded(
         &mut self,
@@ -360,7 +389,11 @@ fn tasks_of(kind: &EventKind) -> Vec<String> {
         | ReviewChangesRequested { task, .. }
         | TaskClarificationSet { task, .. }
         | TaskFileAttached { task, .. }
-        | ReviewStarted { task } => vec![task.clone()],
+        | ReviewStarted { task }
+        | ReviewerAdded { task, .. }
+        | ReviewerRemoved { task, .. }
+        | TaskColumnSet { task, .. } => vec![task.clone()],
+        ColumnCleared { tasks, .. } => tasks.clone(),
         TasksLinked { task, related, .. } => vec![task.clone(), related.clone()],
         TeamCreated { .. }
         | MemberAdded { .. }
@@ -372,11 +405,18 @@ fn tasks_of(kind: &EventKind) -> Vec<String> {
         | ProcessStopped { .. }
         | ColumnOrderSet { .. }
         | TeamDeleted { .. }
+        | TeamRenamed { .. }
         | MessageReacted { .. }
         | ScheduleSet { .. }
         | ScheduleRemoved { .. }
         | PermissionRequested { .. }
-        | PermissionDecided { .. } => vec![],
+        | PermissionDecided { .. }
+        | GroupChatCreated { .. }
+        | GroupChatUpdated { .. }
+        | GroupChatDeleted { .. }
+        | MemberHeartbeat { .. }
+        | LaunchRequested { .. }
+        | StopRequested { .. } => vec![],
     }
 }
 

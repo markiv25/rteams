@@ -229,7 +229,9 @@ fn deleted_team_rejects_everything_but_restore() {
                 to: None,
                 text: "x".into(),
                 mode: None,
-                from_team: None
+                from_team: None,
+                attachments: vec![],
+                chat: None,
             }
         ),
         Err(CoreError::TeamDeleted)
@@ -270,6 +272,8 @@ fn reactions_toggle_per_actor_and_emoji() {
             text: "hi".into(),
             mode: None,
             from_team: None,
+            attachments: vec![],
+            chat: None,
         },
     );
     let seq = f.store.state().messages[0].seq;
@@ -315,6 +319,8 @@ fn from_team_is_carried_on_the_message() {
             text: "hello".into(),
             mode: None,
             from_team: Some("other".into()),
+            attachments: vec![],
+            chat: None,
         },
     );
     assert_eq!(
@@ -328,7 +334,9 @@ fn from_team_is_carried_on_the_message() {
                 to: Some("ghost".into()),
                 text: "x".into(),
                 mode: None,
-                from_team: Some("other".into())
+                from_team: Some("other".into()),
+                attachments: vec![],
+                chat: None,
             }
         ),
         Err(CoreError::UnknownMember(_))
@@ -478,6 +486,10 @@ fn member_runtime_and_worktree() {
         runtime: runtime.map(Into::into),
         worktree,
         icon: None,
+        effort: None,
+        fast: None,
+        context_limit: None,
+        mcp_allow: None,
     };
     f.run("lead", upd(Some("gemini"), Some(true)));
     let m = f

@@ -3,6 +3,7 @@
 //! `WakeOrder` (reason = `nudge.reason`, prompt = `wake::build_prompt`). Nothing else spawns.
 
 pub mod agenda;
+pub mod api;
 pub mod diagnostics;
 pub mod fingerprint;
 pub mod nudge;
@@ -10,6 +11,7 @@ pub mod reconcile;
 pub mod store;
 
 pub use agenda::{build_agenda, Agenda, AgendaItem};
+pub use api::{ack, status};
 pub use diagnostics::{diagnose, MemberDiagnostic};
 pub use nudge::{Nudge, WorkSync};
 pub use reconcile::Decision;

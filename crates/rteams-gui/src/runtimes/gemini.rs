@@ -60,7 +60,12 @@ impl GeminiFamily {
             .collect()
     }
     pub fn build_command(&self, ctx: &LaunchCtx) -> Command {
-        let _ = write_mcp_servers_file(&ctx.workdir, self.settings, mcp_server_entry(ctx, true));
+        let _ = write_mcp_servers_file_with(
+            &ctx.workdir,
+            self.settings,
+            mcp_server_entry(ctx, true),
+            &ctx.extra_mcp,
+        );
         let mut c = base_command(ctx);
         c.arg("-p")
             .arg(prompt_with_system(ctx))
@@ -83,6 +88,9 @@ impl GeminiFamily {
             };
         }
         c.arg("--allowed-mcp-server-names").arg("rteams");
+        for (name, _) in &ctx.extra_mcp {
+            c.arg("--allowed-mcp-server-names").arg(name);
+        }
         c
     }
     pub fn summarize_line(&self, line: &str) -> Vec<String> {
@@ -175,6 +183,9 @@ impl AgentRuntime for Gemini {
         GEMINI.session_id(line)
     }
     /// `gemini --resume` takes an index/`latest`, not a stable id we can pass safely.
+    fn login_command(&self) -> Option<&'static str> {
+        Some("gemini")
+    }
     fn supports_resume(&self) -> bool {
         false
     }

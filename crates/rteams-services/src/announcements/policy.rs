@@ -69,7 +69,7 @@ pub fn select_auto<'a>(
 ) -> Option<&'a Announcement> {
     items
         .iter()
-        .filter(|a| counts_as_unread(a, st, now_ms, app_version))
+        .filter(|a| counts_as_unread(a, st, now_ms, app_version) && !st.is_auto_claimed(&a.id))
         .max_by_key(|a| a.published_at)
 }
 

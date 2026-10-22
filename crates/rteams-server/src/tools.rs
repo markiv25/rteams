@@ -97,6 +97,18 @@ pub fn error_code(e: &CoreError) -> &'static str {
         CoreError::PermissionExists(_) => "permission_exists",
         CoreError::PermissionNotFound(_) => "permission_not_found",
         CoreError::PermissionDecided(_) => "permission_decided",
+        CoreError::GroupChatNotFound(_) => "group_chat_not_found",
+        CoreError::GroupChatExists(_) => "group_chat_exists",
+        CoreError::ChatWithRecipient => "chat_with_recipient",
+        CoreError::EmptyGroupUpdate => "empty_group_update",
+        CoreError::ReviewerExists { .. } => "reviewer_exists",
+        CoreError::ReviewerNotFound { .. } => "reviewer_not_found",
+        CoreError::NotArchived(_) => "not_archived",
+        CoreError::NoPath { .. } => "no_path",
+        CoreError::ColumnNotClearable(_) => "column_not_clearable",
+        CoreError::ColumnEmpty(_) => "column_empty",
+        CoreError::InvalidHeartbeat(_) => "invalid_heartbeat",
+        CoreError::InvalidEffort(_) => "invalid_effort",
     }
 }
 
@@ -182,6 +194,10 @@ struct MemberUpdate {
     runtime: Option<String>,
     worktree: Option<bool>,
     icon: Option<String>,
+    effort: Option<String>,
+    fast: Option<bool>,
+    context_limit: Option<u32>,
+    mcp_allow: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +221,8 @@ struct Comment {
     task: String,
     actor: String,
     text: String,
+    #[serde(default)]
+    attachments: Vec<rteams_core::Attachment>,
 }
 
 #[derive(Deserialize)]
@@ -238,6 +256,11 @@ struct MessageSend {
     mode: Option<String>,
     /// Sender's team for a cross-team message; the actor then need not be a member here.
     from_team: Option<String>,
+    /// Group chat id; the message goes to that chat (then `to` must be absent).
+    #[serde(default)]
+    chat: Option<String>,
+    #[serde(default)]
+    attachments: Vec<rteams_core::Attachment>,
 }
 
 #[derive(Deserialize)]
@@ -401,13 +424,13 @@ struct MemberBriefingArgs {
     member: String,
 }
 
-fn args<T: DeserializeOwned>(v: Value) -> Result<T, ToolError> {
+pub(crate) fn args<T: DeserializeOwned>(v: Value) -> Result<T, ToolError> {
     serde_json::from_value(v).map_err(|e| ToolError::InvalidArguments(e.to_string()))
 }
 
 // ---- dispatch ----
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
@@ -415,7 +438,7 @@ fn now_ms() -> i64 {
 
 /// Optional idempotency key on any write tool: a retry with the same key returns the
 /// original result instead of appending a second event.
-fn command_id(raw: &Value) -> Option<String> {
+pub(crate) fn command_id(raw: &Value) -> Option<String> {
     raw.get("command_id")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -423,7 +446,7 @@ fn command_id(raw: &Value) -> Option<String> {
 
 /// Run one command and return the event it produced. The store locks, catches up with other
 /// processes, then decides and appends, so the command is validated against the latest state.
-fn exec(
+pub(crate) fn exec(
     store: &mut dyn Store,
     cid: Option<&str>,
     actor: &str,
@@ -434,7 +457,7 @@ fn exec(
 
 /// The task plus the derived dependency views: `blocks` (inverse of blocked_by) and
 /// `waiting_on` (dependencies not yet done).
-fn task_json(state: &State, id: &str) -> Value {
+pub(crate) fn task_json(state: &State, id: &str) -> Value {
     let Some(task) = state.task(id) else {
         return Value::Null;
     };
@@ -445,7 +468,7 @@ fn task_json(state: &State, id: &str) -> Value {
 }
 
 /// Uniform reply for task writes: the event that happened and the task as it now stands.
-fn task_reply(store: &mut dyn Store, seq: u64, id: &str) -> Result<Value, ToolError> {
+pub(crate) fn task_reply(store: &mut dyn Store, seq: u64, id: &str) -> Result<Value, ToolError> {
     Ok(json!({ "event_seq": seq, "task": task_json(store.state()?, id) }))
 }
 
@@ -462,7 +485,7 @@ fn transition(
     owner_or_lead(store, cid, &a.actor, &a.task, cmd)
 }
 
-fn is_lead(state: &State, name: &str) -> bool {
+pub(crate) fn is_lead(state: &State, name: &str) -> bool {
     state.team.as_ref().is_some_and(|t| {
         t.members
             .iter()
@@ -471,7 +494,7 @@ fn is_lead(state: &State, name: &str) -> bool {
 }
 
 /// Policy guard: only an active lead may proceed.
-fn lead_only(actor: &str) -> impl Fn(&State) -> Result<(), String> + '_ {
+pub(crate) fn lead_only(actor: &str) -> impl Fn(&State) -> Result<(), String> + '_ {
     move |s| {
         if is_lead(s, actor) {
             Ok(())
@@ -482,7 +505,12 @@ fn lead_only(actor: &str) -> impl Fn(&State) -> Result<(), String> + '_ {
 }
 
 /// Allow `actor` if they are `expected` (e.g. the task owner) or a lead.
-fn authorize(state: &State, actor: &str, expected: Option<&str>, who: &str) -> Result<(), String> {
+pub(crate) fn authorize(
+    state: &State,
+    actor: &str,
+    expected: Option<&str>,
+    who: &str,
+) -> Result<(), String> {
     if !state.is_member(actor) {
         Err(format!("{actor} is not an active team member"))
     } else if expected == Some(actor) || is_lead(state, actor) {
@@ -493,7 +521,7 @@ fn authorize(state: &State, actor: &str, expected: Option<&str>, who: &str) -> R
 }
 
 /// Working agreement handed to every member on bootstrap.
-const PROTOCOL: [&str; 5] = [
+pub(crate) const PROTOCOL: [&str; 5] = [
     "Call task_briefing for your work queue: act on `actionable` in order; `awareness` is watch-only.",
     "task_start before working a task; task_add_comment with your results; then task_complete.",
     "Ask for review with review_request (owner or lead only); the reviewer answers with review_approve or review_request_changes.",
@@ -501,7 +529,7 @@ const PROTOCOL: [&str; 5] = [
     "Poll inbox_get with the next_cursor from your last call; there are no work-sync tokens, the briefing is derived on demand.",
 ];
 
-fn require_member(state: &State, actor: &str) -> Result<(), ToolError> {
+pub(crate) fn require_member(state: &State, actor: &str) -> Result<(), ToolError> {
     if state.is_member(actor) {
         Ok(())
     } else {
@@ -513,7 +541,7 @@ fn require_member(state: &State, actor: &str) -> Result<(), ToolError> {
 /// state machine has accepted the command and before the event is appended, so check, decide
 /// and append are atomic across processes. A retried `command_id` returns the original result
 /// without consulting the guard.
-fn guarded(
+pub(crate) fn guarded(
     store: &mut dyn Store,
     cid: Option<&str>,
     actor: &str,
@@ -546,7 +574,7 @@ fn review(
 }
 
 /// Task lifecycle writes: only the task owner or a lead may mutate a task.
-fn owner_or_lead(
+pub(crate) fn owner_or_lead(
     store: &mut dyn Store,
     cid: Option<&str>,
     actor: &str,
@@ -825,7 +853,12 @@ pub fn call(store: &mut dyn Store, name: &str, raw: Value) -> Result<Value, Tool
             let a: MemberUpdate = args(raw)?;
             let (actor, name) = (a.actor.as_str(), a.name.as_str());
             let sets_role = a.role.is_some();
-            let sets_runtime = a.runtime.is_some() || a.worktree.is_some();
+            let sets_runtime = a.runtime.is_some()
+                || a.worktree.is_some()
+                || a.effort.is_some()
+                || a.fast.is_some()
+                || a.context_limit.is_some()
+                || a.mcp_allow.is_some();
             let cmd = Command::UpdateMember {
                 name: a.name.clone(),
                 role: a.role.clone(),
@@ -834,6 +867,10 @@ pub fn call(store: &mut dyn Store, name: &str, raw: Value) -> Result<Value, Tool
                 runtime: a.runtime.clone(),
                 worktree: a.worktree,
                 icon: a.icon.clone(),
+                effort: a.effort.clone(),
+                fast: a.fast,
+                context_limit: a.context_limit,
+                mcp_allow: a.mcp_allow.clone(),
             };
             // A lead edits anyone; a member may edit only their own prompt, model and icon.
             let guard = |s: &State| {
@@ -894,6 +931,7 @@ pub fn call(store: &mut dyn Store, name: &str, raw: Value) -> Result<Value, Tool
                 Command::Comment {
                     task: a.task.clone(),
                     text: a.text,
+                    attachments: a.attachments,
                 },
             )?
             .seq;
@@ -979,18 +1017,27 @@ pub fn call(store: &mut dyn Store, name: &str, raw: Value) -> Result<Value, Tool
             if a.from_team.is_none() {
                 require_member(store.state()?, &a.actor)?;
             }
-            let seq = exec(
-                store,
-                cid,
-                &a.actor,
-                Command::SendMessage {
-                    to: a.to,
-                    text: a.text,
-                    mode: a.mode,
-                    from_team: a.from_team,
-                },
-            )?
-            .seq;
+            let actor = a.actor.as_str();
+            let chat = a.chat.clone();
+            let cmd = Command::SendMessage {
+                to: a.to.clone(),
+                text: a.text.clone(),
+                mode: a.mode.clone(),
+                from_team: a.from_team.clone(),
+                chat: a.chat.clone(),
+                attachments: a.attachments.clone(),
+            };
+            // A group chat is for its members (and leads); domain errors still win.
+            let guard = |s: &State| match chat.as_deref().and_then(|c| s.group(c)) {
+                Some(g) if !g.members.iter().any(|m| m == actor) && !is_lead(s, actor) => {
+                    Err(format!("{actor} is not a member of group chat {}", g.id))
+                }
+                _ => Ok(()),
+            };
+            let seq = store
+                .execute_guarded(actor, now_ms(), cid, cmd, &guard)?
+                .event
+                .seq;
             Ok(json!({ "event_seq": seq }))
         }
         "inbox_get" => {
@@ -1152,7 +1199,7 @@ pub fn call(store: &mut dyn Store, name: &str, raw: Value) -> Result<Value, Tool
 
 // ---- tools/list ----
 
-fn tool(name: &str, description: &str, mut props: Value, required: &[&str]) -> Value {
+pub(crate) fn tool(name: &str, description: &str, mut props: Value, required: &[&str]) -> Value {
     // Every write tool names its actor; every write tool accepts an idempotency key.
     if props.get("actor").is_some() {
         props["command_id"] = json!({
@@ -1168,7 +1215,21 @@ fn tool(name: &str, description: &str, mut props: Value, required: &[&str]) -> V
     })
 }
 
+pub(crate) fn attachments_schema() -> Value {
+    json!({ "type": "array", "description": "Files to attach", "items": {
+        "type": "object",
+        "properties": { "name": { "type": "string" }, "path": { "type": "string" } },
+        "required": ["name", "path"],
+    }})
+}
+
 pub fn definitions() -> Vec<Value> {
+    let mut all = base_definitions();
+    all.extend(crate::extra::definitions());
+    all
+}
+
+fn base_definitions() -> Vec<Value> {
     let s = |d: &str| json!({ "type": "string", "description": d });
     let task = s("Task id");
     let actor = s("Your member name");
@@ -1303,6 +1364,10 @@ pub fn definitions() -> Vec<Value> {
                 "runtime": s("AI runtime id (lead only)"),
                 "worktree": { "type": "boolean", "description": "Work in its own git worktree (lead only)" },
                 "icon": s("Avatar icon, one emoji (empty string resets to the default)"),
+                "effort": s("Reasoning effort low|medium|high, empty clears (lead only)"),
+                "fast": { "type": "boolean", "description": "Fast mode (lead only)" },
+                "context_limit": { "type": "integer", "minimum": 0, "description": "Context window limit in tokens, 0 clears (lead only)" },
+                "mcp_allow": { "type": "array", "items": { "type": "string" }, "description": "Extra MCP server names the member may use; replaces the list (lead only)" },
             }),
             &["actor", "name"],
         ),
@@ -1322,7 +1387,7 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "task_add_comment",
             "Add a comment to a task. The owner and reviewer see it in their inbox.",
-            json!({ "task": task, "actor": actor, "text": s("Comment text") }),
+            json!({ "task": task, "actor": actor, "text": s("Comment text"), "attachments": attachments_schema() }),
             &["task", "actor", "text"],
         ),
         tool(
@@ -1373,6 +1438,8 @@ pub fn definitions() -> Vec<Value> {
                 "text": s("Message"),
                 "mode": { "type": "string", "enum": ["do", "ask", "delegate"], "description": "Optional intent of the message" },
                 "from_team": s("Sender's team for a cross-team message (actor need not be a member here)"),
+                "chat": s("Group chat id to post in (omit `to`); members and leads only"),
+                "attachments": attachments_schema(),
             }),
             &["actor", "text"],
         ),

@@ -26,7 +26,9 @@ fn golden_json() {
             to: None,
             text: "hi".into(),
             mode: None,
-            from_team: None
+            from_team: None,
+            attachments: vec![],
+            chat: None,
         }),
         r#"{"seq":3,"ts":1700,"actor":"echo","type":"message_sent","to":null,"text":"hi"}"#
     );
@@ -98,6 +100,7 @@ fn every_event_kind_round_trips() {
         EventKind::TaskCommented {
             task: "a".into(),
             text: "x".into(),
+            attachments: vec![],
         },
         EventKind::ReviewRequested {
             task: "a".into(),
@@ -116,6 +119,8 @@ fn every_event_kind_round_trips() {
             text: "x".into(),
             mode: Some("ask".into()),
             from_team: None,
+            attachments: vec![],
+            chat: None,
         },
         EventKind::TeamConfigured {
             project_path: Some("/p".into()),
@@ -129,6 +134,10 @@ fn every_event_kind_round_trips() {
             runtime: None,
             worktree: None,
             icon: None,
+            effort: None,
+            fast: None,
+            context_limit: None,
+            mcp_allow: None,
         },
         EventKind::MemberRemoved {
             name: "echo".into(),
@@ -190,6 +199,10 @@ fn new_events_golden_and_old_lines_still_parse() {
             runtime: None,
             worktree: None,
             icon: None,
+            effort: None,
+            fast: None,
+            context_limit: None,
+            mcp_allow: None,
         }),
         r#"{"seq":3,"ts":1700,"actor":"echo","type":"member_updated","name":"x","prompt":"p"}"#
     );
@@ -205,7 +218,9 @@ fn new_events_golden_and_old_lines_still_parse() {
             to: None,
             text: "hi".into(),
             mode: Some("do".into()),
-            from_team: None
+            from_team: None,
+            attachments: vec![],
+            chat: None,
         }),
         r#"{"seq":3,"ts":1700,"actor":"echo","type":"message_sent","to":null,"text":"hi","mode":"do"}"#
     );
@@ -218,7 +233,9 @@ fn new_events_golden_and_old_lines_still_parse() {
             to: None,
             text: "hi".into(),
             mode: None,
-            from_team: None
+            from_team: None,
+            attachments: vec![],
+            chat: None,
         }
     );
 }
@@ -341,6 +358,10 @@ fn golden_json_wave3_events() {
                 runtime: Some("gemini".into()),
                 worktree: Some(true),
                 icon: None,
+                effort: None,
+                fast: None,
+                context_limit: None,
+                mcp_allow: None,
             },
             r#"{"seq":3,"ts":1700,"actor":"echo","type":"member_updated","name":"a","runtime":"gemini","worktree":true}"#,
         ),
@@ -350,6 +371,8 @@ fn golden_json_wave3_events() {
                 text: "hi".into(),
                 mode: None,
                 from_team: Some("other".into()),
+                attachments: vec![],
+                chat: None,
             },
             r#"{"seq":3,"ts":1700,"actor":"echo","type":"message_sent","to":null,"text":"hi","from_team":"other"}"#,
         ),

@@ -208,6 +208,8 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
             to: Some("echo".into()),
             text: "direct to echo".into(),
             from_team: None,
+            attachments: vec![],
+            chat: None,
         },
     ); // seq 7
     f.run(
@@ -217,6 +219,8 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
             to: Some("ember".into()),
             text: "direct to ember".into(),
             from_team: None,
+            attachments: vec![],
+            chat: None,
         },
     );
     f.run(
@@ -226,6 +230,8 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
             to: None,
             text: "broadcast".into(),
             from_team: None,
+            attachments: vec![],
+            chat: None,
         },
     );
     f.run(
@@ -235,6 +241,8 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
             to: None,
             text: "my own broadcast".into(),
             from_team: None,
+            attachments: vec![],
+            chat: None,
         },
     );
     f.run(
@@ -242,6 +250,7 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
         Command::Comment {
             task: "mine".into(),
             text: "comment on mine".into(),
+            attachments: vec![],
         },
     );
     f.run(
@@ -249,6 +258,7 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
         Command::Comment {
             task: "theirs".into(),
             text: "comment on theirs".into(),
+            attachments: vec![],
         },
     );
     f.run(
@@ -256,6 +266,7 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
         Command::Comment {
             task: "mine".into(),
             text: "my own comment".into(),
+            attachments: vec![],
         },
     );
 
@@ -285,6 +296,8 @@ fn inbox_unifies_direct_broadcast_and_task_comments_with_cursor() {
             to: Some("echo".into()),
             text: "later".into(),
             from_team: None,
+            attachments: vec![],
+            chat: None,
         },
     );
     let later = inbox(f.store.state(), "echo", i.next_cursor);
@@ -348,6 +361,7 @@ fn review_feedback_flows_into_owner_inbox_as_task_comments() {
         Command::Comment {
             task: "a".into(),
             text: "thanks".into(),
+            attachments: vec![],
         },
     );
     let p: Vec<_> = inbox(f.store.state(), "pixel", 0)

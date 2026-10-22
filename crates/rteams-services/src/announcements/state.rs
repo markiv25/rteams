@@ -13,6 +13,8 @@ pub struct State {
     pub schema_version: u32,
     pub read: Vec<String>,
     pub dismissed: Vec<String>,
+    /// Ids already offered by the startup auto-open (never offered twice).
+    pub auto_claimed: Vec<String>,
     /// Unix ms of the first time the app saw the feed; gates `show_to_new_users`.
     pub first_app_opened_at: i64,
 }
@@ -23,6 +25,7 @@ impl Default for State {
             schema_version: 1,
             read: Vec::new(),
             dismissed: Vec::new(),
+            auto_claimed: Vec::new(),
             first_app_opened_at: 0,
         }
     }
@@ -67,6 +70,14 @@ impl State {
 
     pub fn is_dismissed(&self, id: &str) -> bool {
         self.dismissed.iter().any(|x| x == id)
+    }
+
+    pub fn is_auto_claimed(&self, id: &str) -> bool {
+        self.auto_claimed.iter().any(|x| x == id)
+    }
+
+    pub fn claim_auto(&mut self, id: &str) {
+        push_capped(&mut self.auto_claimed, id);
     }
 
     pub fn mark_read(&mut self, id: &str) {

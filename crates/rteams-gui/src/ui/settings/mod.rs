@@ -22,6 +22,7 @@ pub mod connection;
 pub mod general;
 pub mod local_claude_root;
 pub mod notifications;
+pub mod permissions;
 pub mod workspace_profiles;
 
 const DEBOUNCE: Duration = Duration::from_millis(350);
@@ -31,6 +32,7 @@ pub enum Section {
     General,
     Notifications,
     Advanced,
+    Permissions,
     CliRuntime,
     Providers,
     Connection,
@@ -38,10 +40,11 @@ pub enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 7] = [
+    const ALL: [Section; 8] = [
         Section::General,
         Section::Notifications,
         Section::Advanced,
+        Section::Permissions,
         Section::CliRuntime,
         Section::Providers,
         Section::Connection,
@@ -52,7 +55,7 @@ impl Section {
         match self {
             Section::General => Icon::Settings,
             Section::Notifications => Icon::Bell,
-            Section::Advanced => Icon::Shield,
+            Section::Advanced | Section::Permissions => Icon::Shield,
             Section::CliRuntime => Icon::Terminal,
             Section::Providers => Icon::Cpu,
             Section::Connection => Icon::Globe,
@@ -65,6 +68,7 @@ impl Section {
             Section::General => "settings.tabs.general.label",
             Section::Notifications => "settings.tabs.notifications.label",
             Section::Advanced => "settings.tabs.advanced.label",
+            Section::Permissions => "rteams.settings.permissions.nav",
             Section::CliRuntime => "settings.cliRuntime.title",
             Section::Providers => "settings.runtimeProvider.tabs.providers",
             Section::Connection => "settings.connection.title",
@@ -85,6 +89,7 @@ pub struct SettingsScreen {
     general: general::State,
     notifications: notifications::State,
     advanced: advanced::State,
+    permissions: permissions::State,
     cli: cli_runtime::State,
     connection: connection::State,
     workspace: workspace_profiles::State,
@@ -113,6 +118,7 @@ impl SettingsScreen {
             general: Default::default(),
             notifications: Default::default(),
             advanced: Default::default(),
+            permissions: Default::default(),
             cli: cli_runtime::State::new(),
             connection: Default::default(),
             workspace: Default::default(),
@@ -134,8 +140,15 @@ impl SettingsScreen {
 
     /// Write any pending change now.
     pub fn flush(&mut self) {
-        if let (Some(cfg), Some(home)) = (&self.cfg, &self.home) {
+        if let (Some(cfg), Some(home)) = (&mut self.cfg, &self.home) {
             if self.dirty_at.take().is_some() {
+                // Other screens (Providers) write keys to `extra` meanwhile: keep the disk copy of
+                // keys this cached config lacks, and of provider-owned keys, instead of clobbering.
+                for (k, v) in AppConfig::load(home).extra {
+                    if k.starts_with("providers.") || !cfg.extra.contains_key(&k) {
+                        cfg.extra.insert(k, v);
+                    }
+                }
                 match cfg.save(home) {
                     Ok(()) => {
                         self.save_error = None;
@@ -155,6 +168,7 @@ impl SettingsScreen {
             self.locale_tr = Some(I18n::from_pref(&cfg.general.locale));
             self.cfg = Some(cfg);
             self.connection = Default::default();
+            self.permissions = Default::default();
         }
     }
 
@@ -225,7 +239,21 @@ impl Screen for SettingsScreen {
                 |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     for s in Section::ALL {
-                        if nav_item(ui, s.icon(), &tr.t(s.label_key()), self.section == s).clicked()
+                        if nav_item(
+                            ui,
+                            s.icon(),
+                            &crate::ui::onboarding::tx(
+                                tr,
+                                s.label_key(),
+                                if s == Section::Permissions {
+                                    "Permissions"
+                                } else {
+                                    ""
+                                },
+                            ),
+                            self.section == s,
+                        )
+                        .clicked()
                         {
                             self.section = s;
                         }
@@ -262,6 +290,10 @@ impl Screen for SettingsScreen {
                                 Section::Advanced => {
                                     changed |=
                                         advanced::show(ui, cfg, &mut self.advanced, tr, &home);
+                                }
+                                Section::Permissions => {
+                                    changed |=
+                                        permissions::show(ui, cfg, &mut self.permissions, tr);
                                 }
                                 Section::CliRuntime => {
                                     changed |= cli_runtime::show(ui, cfg, &mut self.cli, tr);
@@ -465,6 +497,21 @@ mod tests {
         assert!(s.config_changed());
         assert!(!s.config_changed());
         assert_eq!(AppConfig::load(&home).general.theme, "dark");
+        // A key another screen wrote meanwhile survives the next Settings save.
+        let mut other = AppConfig::load(&home);
+        other.extra.insert(
+            "providers.model_limits.x.y".into(),
+            serde_json::json!({ "context": 5 }),
+        );
+        other.save(&home).unwrap();
+        if let Some(c) = s.cfg.as_mut() {
+            c.general.theme = "light".into();
+        }
+        s.mark_dirty();
+        s.flush();
+        let disk = AppConfig::load(&home);
+        assert_eq!(disk.general.theme, "light");
+        assert!(disk.extra.contains_key("providers.model_limits.x.y"));
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -68,9 +68,44 @@ pub fn parse_version(out: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// Tool dirs a GUI app started from Finder/launchd does not have on PATH.
+const EXTRA_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"];
+
+/// PATH plus the usual package-manager dirs (deduplicated, only existing dirs added).
+pub fn search_path() -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for d in EXTRA_DIRS {
+        let d = std::path::PathBuf::from(d);
+        if d.is_dir() && !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    dirs
+}
+
+/// `PATH` value for child processes (see `search_path`).
+pub fn child_path() -> Option<std::ffi::OsString> {
+    std::env::join_paths(search_path()).ok()
+}
+
+/// Does this installer output line mean it wants interactive input (a password)?
+pub fn needs_input(line: &str) -> bool {
+    let l = line.to_lowercase();
+    l.contains("password")
+        || l.contains("a terminal is required")
+        || l.contains("no tty present")
+        || l.contains("askpass")
+}
+
 /// Run `tmux -V`; None when tmux is missing or fails.
 pub fn detect_tmux() -> Option<String> {
-    let out = Command::new("tmux").arg("-V").output().ok()?;
+    let mut cmd = Command::new("tmux");
+    if let Some(p) = child_path() {
+        cmd.env("PATH", p);
+    }
+    let out = cmd.arg("-V").output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -79,10 +114,7 @@ pub fn detect_tmux() -> Option<String> {
 
 /// Is `bin` found on PATH?
 pub fn on_path(bin: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|d| d.join(bin).is_file())
+    search_path().iter().any(|d| d.join(bin).is_file())
 }
 
 #[cfg(test)]
@@ -95,6 +127,23 @@ mod tests {
         assert_eq!(parse_os_release(t), vec!["ubuntu", "debian"]);
         assert_eq!(parse_os_release("ID=arch"), vec!["arch"]);
         assert!(parse_os_release("").is_empty());
+    }
+
+    #[test]
+    fn detects_input_prompts() {
+        assert!(needs_input("Password:"));
+        assert!(needs_input(
+            "sudo: a terminal is required to read the password"
+        ));
+        assert!(!needs_input("==> Downloading tmux"));
+    }
+
+    #[test]
+    fn search_path_keeps_existing_path_entries() {
+        let p = search_path();
+        for d in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+            assert!(p.contains(&d));
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 pub mod announcements;
 pub mod atomic;
+pub mod attachments;
 pub mod claude_root;
 pub mod config;
 pub mod docpreview;

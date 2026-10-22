@@ -93,8 +93,15 @@ fn handshake_and_tool_listing() {
         assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
         assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
     }
-    // no work-sync token tools
-    assert!(!names.iter().any(|n| n.contains("work_sync")));
+    // work-sync report exists but is token-free (no agendaFingerprint / reportToken required)
+    let report = tools
+        .iter()
+        .find(|t| t["name"] == "member_work_sync_report")
+        .unwrap();
+    assert_eq!(
+        report["inputSchema"]["required"],
+        json!(["member", "state"])
+    );
 }
 
 #[test]
@@ -1086,4 +1093,62 @@ fn message_mode_validation() {
     );
     let inbox = ok(&s, "inbox_get", json!({ "member": "pixel" }));
     assert_eq!(inbox["inbox"]["items"][0]["mode"], "ask");
+}
+
+#[test]
+fn original_parity_tools() {
+    let s = Server::new();
+    owned_task(&s);
+    let r = ok(&s, "app_get_connection_info", json!({}));
+    assert_eq!(r["app"], "rteams");
+    assert_eq!(r["team"], "t");
+
+    let r = ok(&s, "kanban_list_reviewers", json!({}));
+    assert!(r["reviewers"].as_array().unwrap().contains(&json!("pixel")));
+
+    let r = ok(
+        &s,
+        "member_work_sync_report",
+        json!({ "memberName": "echo", "state": "blocked", "taskIds": ["1"], "note": "waiting" }),
+    );
+    assert_eq!(r["heartbeat"]["status"], "stuck");
+    assert_eq!(r["heartbeat"]["task"], "1");
+
+    let r = ok(
+        &s,
+        "runtime_deliver_message",
+        json!({ "fromMemberName": "echo", "to": "pixel", "text": "hi" }),
+    );
+    assert_eq!(r["to"], "pixel");
+    let r = ok(
+        &s,
+        "runtime_deliver_message",
+        json!({ "actor": "echo", "text": "lead?" }),
+    );
+    assert_eq!(r["to"], "team-lead");
+
+    let (err, _) = call(
+        &s,
+        "task_set_status",
+        json!({ "taskId": "1", "status": "completed", "actor": "pixel" }),
+    );
+    assert!(err, "non-owner may not set status");
+    ok(
+        &s,
+        "task_set_status",
+        json!({ "taskId": "1", "status": "deleted", "actor": "echo" }),
+    );
+
+    ok(
+        &s,
+        "process_register",
+        json!({ "actor": "echo", "pid": 77, "label": "svc" }),
+    );
+    let r = ok(&s, "process_stop", json!({ "pid": 77 }));
+    assert_eq!(
+        r["processes"]
+            .as_array()
+            .map(|a| a.iter().any(|p| p["pid"] == 77 && p["running"] == true)),
+        Some(false)
+    );
 }

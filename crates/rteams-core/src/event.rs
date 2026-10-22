@@ -73,6 +73,8 @@ pub enum EventKind {
     TaskCommented {
         task: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::Attachment>,
     },
     ReviewRequested {
         task: String,
@@ -94,6 +96,10 @@ pub enum EventKind {
         mode: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_team: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::Attachment>,
     },
     /// Only the fields that changed are present.
     TeamConfigured {
@@ -116,6 +122,14 @@ pub enum EventKind {
         worktree: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         icon: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_allow: Option<Vec<String>>,
     },
     MemberRemoved {
         name: String,
@@ -155,6 +169,9 @@ pub enum EventKind {
     TeamDeleted {
         deleted: bool,
     },
+    TeamRenamed {
+        name: String,
+    },
     MessageReacted {
         message_seq: u64,
         emoji: String,
@@ -175,5 +192,53 @@ pub enum EventKind {
         id: String,
         allow: bool,
         note: Option<String>,
+    },
+    GroupChatCreated {
+        id: String,
+        name: String,
+        members: Vec<String>,
+    },
+    GroupChatUpdated {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        members: Option<Vec<String>>,
+    },
+    GroupChatDeleted {
+        id: String,
+    },
+    ReviewerAdded {
+        task: String,
+        reviewer: String,
+    },
+    ReviewerRemoved {
+        task: String,
+        reviewer: String,
+    },
+    /// Direct status move along a legal path (kanban drag / `kanban_set_column`).
+    TaskColumnSet {
+        task: String,
+        from: Status,
+        to: Status,
+    },
+    /// Every listed task was archived out of `column`.
+    ColumnCleared {
+        column: String,
+        tasks: Vec<String>,
+    },
+    MemberHeartbeat {
+        member: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    LaunchRequested {
+        members: Vec<String>,
+    },
+    StopRequested {
+        members: Vec<String>,
     },
 }

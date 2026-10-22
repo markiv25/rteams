@@ -40,7 +40,7 @@ pub enum CoreError {
     InvalidMode(String),
     #[error("configuration update must change at least one field")]
     EmptyConfig,
-    #[error("member update must change the role, prompt, model, runtime or worktree")]
+    #[error("member update must change at least one field")]
     EmptyMemberUpdate,
     #[error("member runtime must not be empty")]
     EmptyRuntime,
@@ -66,6 +66,34 @@ pub enum CoreError {
     PermissionNotFound(String),
     #[error("permission request {0} was already decided")]
     PermissionDecided(String),
+    #[error("group chat {0} not found")]
+    GroupChatNotFound(String),
+    #[error("group chat {0} already exists")]
+    GroupChatExists(String),
+    #[error("a message to a group chat cannot also have a direct recipient")]
+    ChatWithRecipient,
+    #[error("group chat update must change the name or the members")]
+    EmptyGroupUpdate,
+    #[error("{reviewer} is already a reviewer of task {task}")]
+    ReviewerExists { task: String, reviewer: String },
+    #[error("{reviewer} is not a reviewer of task {task}")]
+    ReviewerNotFound { task: String, reviewer: String },
+    #[error("task {0} is not archived")]
+    NotArchived(String),
+    #[error("task {task} cannot be moved from {from:?} to {to:?}")]
+    NoPath {
+        task: String,
+        from: Status,
+        to: Status,
+    },
+    #[error("column {0:?} cannot be cleared (only approved or done)")]
+    ColumnNotClearable(String),
+    #[error("nothing to clear in column {0:?}")]
+    ColumnEmpty(String),
+    #[error("invalid heartbeat status {0:?} (starting, ready, working, idle, stuck)")]
+    InvalidHeartbeat(String),
+    #[error("invalid effort {0:?} (low, medium, high)")]
+    InvalidEffort(String),
     #[error("process {0} is already registered and running")]
     ProcessRunning(u32),
     #[error("no running process with pid {0}")]

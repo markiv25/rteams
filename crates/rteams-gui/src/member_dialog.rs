@@ -13,6 +13,8 @@ use crate::runs::{self, RunEvent, RunKind, SessionSummary};
 use crate::runtimes;
 use crate::team::status_chip;
 use crate::theme::{self, Presence};
+use crate::ui::launch_dialog::{parse_limit, EFFORTS};
+use crate::ui::mcp_policy::McpPolicy;
 use crate::view::{Intent, Intents, View};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -23,6 +25,7 @@ enum Tab {
     Messages,
     Stats,
     Sessions,
+    Changes,
     Edit,
 }
 
@@ -39,6 +42,10 @@ struct EditState {
     worktree: bool,
     /// Picked avatar icon; empty = the default from `names::default_icon`.
     icon: String,
+    /// Saved launch settings: effort (`None` = default), fast mode, context-limit text.
+    effort: Option<String>,
+    fast: bool,
+    limit: String,
     confirm_remove: bool,
 }
 
@@ -57,6 +64,11 @@ impl EditState {
         self.runtime = m.and_then(|m| m.runtime.clone());
         self.worktree = m.is_some_and(|m| m.worktree);
         self.icon = m.and_then(|m| m.icon.clone()).unwrap_or_default();
+        self.effort = m.and_then(|m| m.effort.clone());
+        self.fast = m.is_some_and(|m| m.fast);
+        self.limit = m
+            .and_then(|m| m.context_limit)
+            .map_or_else(String::new, |n| n.to_string());
         self.confirm_remove = false;
     }
 
@@ -85,6 +97,25 @@ impl EditState {
 }
 
 impl EditState {
+    /// The `SetMemberLaunch` for changed effort / fast / context limit, or `None` (also when the
+    /// limit text is invalid).
+    fn launch_cmd(&self, v: &View, name: &str) -> Option<GuiCmd> {
+        let m = v.members().iter().find(|m| m.name == name)?;
+        let limit = parse_limit(&self.limit).ok()?;
+        let effort = (self.effort != m.effort).then(|| self.effort.clone().unwrap_or_default());
+        let fast = (self.fast != m.fast).then_some(self.fast);
+        let context_limit = (limit != m.context_limit).then(|| limit.unwrap_or(0));
+        if effort.is_none() && fast.is_none() && context_limit.is_none() {
+            return None;
+        }
+        Some(GuiCmd::SetMemberLaunch {
+            name: name.to_string(),
+            effort,
+            fast,
+            context_limit,
+        })
+    }
+
     /// The `SetMemberRuntime` for a changed runtime / worktree flag, or `None`.
     fn runtime_cmd(&self, v: &View, name: &str) -> Option<GuiCmd> {
         let m = v.members().iter().find(|m| m.name == name)?;
@@ -178,6 +209,13 @@ struct Panels {
     sessions: Option<Vec<SessionSummary>>,
     stats: Option<runs::Stats>,
     open_run: Option<(PathBuf, Vec<RunEvent>)>,
+    preview: Option<(Vec<String>, Vec<String>)>,
+    repo: Option<PathBuf>,
+    /// Files this member changed across their tasks, computed on a worker thread.
+    changes: Option<Vec<crate::changes::AgentFile>>,
+    changes_job: Option<crate::changes::Job<Vec<crate::changes::AgentFile>>>,
+    /// Paths the Changes tab asked the review dialog to open.
+    review_req: Option<Vec<String>>,
 }
 
 impl Panels {
@@ -185,6 +223,10 @@ impl Panels {
         self.sessions = None;
         self.stats = None;
         self.open_run = None;
+        self.preview = None;
+        self.changes = None;
+        self.changes_job = None;
+        self.review_req = None;
     }
 }
 
@@ -196,6 +238,8 @@ pub struct MemberDialog {
     edit: EditState,
     panels: Panels,
     probe: Probe,
+    mcp: McpPolicy,
+    review: crate::ui::review::ReviewDialog,
 }
 
 fn status_pill(tr: &rteams_services::i18n::I18n, s: Status) -> (String, Color32) {
@@ -209,6 +253,15 @@ impl MemberDialog {
             self.panels.home = home;
             self.panels.team = team;
             self.panels.reset();
+        }
+    }
+
+    /// The project repository the Changes tab diffs against.
+    pub fn set_repo(&mut self, repo: Option<PathBuf>) {
+        if self.panels.repo != repo {
+            self.panels.repo = repo;
+            self.panels.changes = None;
+            self.panels.changes_job = None;
         }
     }
 
@@ -246,13 +299,32 @@ impl MemberDialog {
         let tab = &mut self.tab;
         let edit = &mut self.edit;
         let panels = &mut self.panels;
+        let mcp = &mut self.mcp;
         let mut open = true;
         let mut close = false;
         crate::forms::dialog(ctx, ("member_dialog", &name), "", width, &mut open, |ui| {
-            close = body(ui, v, &name, tab, edit, panels, &infos, out);
+            close = body(ui, v, &name, tab, edit, panels, mcp, &infos, out);
         });
         if close || !open {
             self.close();
+        }
+        if let Some(paths) = self.panels.review_req.take() {
+            self.review.open(paths);
+        }
+        if let Some(repo) = self.panels.repo.as_deref() {
+            let task = format!("agent-{name}");
+            let rc = crate::ui::review::ReviewCtx {
+                home: &self.panels.home,
+                team: &self.panels.team,
+                repo,
+                task: &task,
+            };
+            let was_open = self.review.is_open();
+            self.review.show(ctx, v, &rc, out);
+            if was_open && self.review.is_open() {
+                // Rejected hunks change the working tree; recount on the next draw.
+                self.panels.changes = None;
+            }
         }
     }
 }
@@ -266,6 +338,7 @@ fn body(
     tab: &mut Tab,
     edit: &mut EditState,
     panels: &mut Panels,
+    mcp: &mut McpPolicy,
     infos: &[RuntimeInfo],
     out: &mut Intents,
 ) -> bool {
@@ -305,6 +378,11 @@ fn body(
             ui.horizontal(|ui| {
                 ui.label(RichText::new(name).size(20.0).strong().color(color));
                 theme::pill(ui, chip, chip_color);
+                if !is_human {
+                    if let Some((d, tip)) = crate::team::member_diag(ui, v, name) {
+                        theme::pill(ui, v.tr.t(d.key()), d.color()).on_hover_text(tip);
+                    }
+                }
             });
             let rt = v
                 .members()
@@ -385,9 +463,10 @@ fn body(
             (Tab::Messages, v.tr.t("team.messages.title"), msgs.len()),
             (Tab::Stats, v.tr.t("rteams.member.stats"), 0),
             (Tab::Sessions, v.tr.t("common.layout.sections.sessions"), 0),
+            (Tab::Changes, v.tr.t("team.taskDetail.changes.title"), 0),
             (Tab::Edit, v.tr.t("common.schedules.actions.edit"), 0),
         ] {
-            let text = if matches!(t, Tab::Edit | Tab::Stats | Tab::Sessions) {
+            let text = if matches!(t, Tab::Edit | Tab::Stats | Tab::Sessions | Tab::Changes) {
                 label.clone()
             } else {
                 format!("{label} ({n})")
@@ -443,9 +522,10 @@ fn body(
                     });
             }
         }
-        Tab::Edit => edit_tab(ui, v, name, is_human, removed, edit, infos, out),
+        Tab::Edit => edit_tab(ui, v, name, is_human, removed, edit, mcp, infos, out),
         Tab::Stats => stats_tab(ui, v, name, panels),
         Tab::Sessions => sessions_tab(ui, v.tr, name, panels),
+        Tab::Changes => changes_tab(ui, v.tr, name, panels),
         Tab::Messages => {
             if msgs.is_empty() {
                 ui.label(
@@ -471,11 +551,120 @@ fn stat_row(ui: &mut egui::Ui, label: String, value: String) {
     });
 }
 
+/// Every file this member changed across their tasks (from their run logs), with +/- counts.
+/// Computed on a worker thread; a row opens the review dialog on that file.
+fn changes_tab(
+    ui: &mut egui::Ui,
+    tr: &rteams_services::i18n::I18n,
+    name: &str,
+    panels: &mut Panels,
+) {
+    let Some(repo) = panels.repo.clone() else {
+        ui.label(RichText::new(tr.t("rteams.task.noGit")).color(theme::MUTED));
+        return;
+    };
+    if let Some(job) = &panels.changes_job {
+        if let Some(done) = job.take() {
+            panels.changes = Some(done);
+            panels.changes_job = None;
+        }
+    }
+    if panels.changes.is_none() && panels.changes_job.is_none() {
+        let (home, team, member) = (panels.home.clone(), panels.team.clone(), name.to_string());
+        panels.changes_job = Some(crate::changes::Job::spawn(ui.ctx(), move || {
+            crate::changes::agent_changes(&home, &team, &repo, &member)
+        }));
+    }
+    let Some(files) = panels.changes.clone() else {
+        ui.label(RichText::new(tr.t("team.taskDetail.changes.loading")).color(theme::MUTED));
+        return;
+    };
+    if files.is_empty() {
+        ui.label(
+            RichText::new(tr.t("team.taskDetail.changes.empty.noFileChangesRecorded"))
+                .color(theme::MUTED),
+        );
+        return;
+    }
+    let add: usize = files.iter().map(|f| f.added).sum();
+    let del: usize = files.iter().map(|f| f.removed).sum();
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(tr.t_count("team.taskDetail.changes.fileCount", files.len() as u64))
+                .small()
+                .color(theme::MUTED),
+        );
+        ui.label(
+            RichText::new(format!("+{add}"))
+                .small()
+                .color(theme::SUCCESS),
+        );
+        ui.label(RichText::new(format!("-{del}")).small().color(theme::ERROR));
+        if theme::pill_button(ui, &tr.t("team.taskDetail.changes.reviewDiff"), true).clicked() {
+            panels.review_req = Some(files.iter().map(|f| f.path.clone()).collect());
+        }
+        if ui
+            .small_button(tr.t("team.taskDetail.changes.refreshShort"))
+            .clicked()
+        {
+            panels.changes = None;
+        }
+    });
+    ui.add_space(4.0);
+    for f in &files {
+        ui.horizontal_wrapped(|ui| {
+            let r = ui.add(
+                egui::Label::new(RichText::new(&f.path).monospace()).sense(egui::Sense::click()),
+            );
+            ui.label(
+                RichText::new(format!("+{}", f.added))
+                    .small()
+                    .color(theme::SUCCESS),
+            );
+            ui.label(
+                RichText::new(format!("-{}", f.removed))
+                    .small()
+                    .color(theme::ERROR),
+            );
+            let ids: Vec<String> = f
+                .tasks
+                .iter()
+                .map(|t| format!("#{}", theme::short_id(t)))
+                .collect();
+            ui.label(RichText::new(ids.join(" ")).small().color(theme::MUTED));
+            if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                panels.review_req = Some(vec![f.path.clone()]);
+            }
+        });
+    }
+}
+
 fn stats_tab(ui: &mut egui::Ui, v: &View, name: &str, panels: &mut Panels) {
     let stats = *panels
         .stats
         .get_or_insert_with(|| runs::member_stats(&panels.home, &panels.team, name));
     let c = event_counts(v.data.events(), name);
+    let (latest, raw) = panels.preview.get_or_insert_with(|| {
+        (
+            crate::member_preview::latest_activity(&panels.home, &panels.team, name),
+            crate::member_preview::runtime_tail(&panels.home, &panels.team, name, 20),
+        )
+    });
+    if !latest.is_empty() {
+        ui.label(RichText::new("Latest activity").strong());
+        for l in latest.iter() {
+            ui.label(RichText::new(l).monospace().color(theme::TEXT_2));
+        }
+        egui::CollapsingHeader::new("Runtime log tail")
+            .id_salt("member_runtime_tail")
+            .show(ui, |ui| {
+                for l in raw.iter() {
+                    let t: String = l.chars().take(300).collect();
+                    ui.label(RichText::new(t).monospace().small().color(theme::MUTED));
+                }
+            });
+        ui.add_space(8.0);
+    }
     ui.label(RichText::new(v.tr.t("rteams.member.runs")).strong());
     stat_row(
         ui,
@@ -639,6 +828,7 @@ fn edit_tab(
     is_human: bool,
     removed: bool,
     edit: &mut EditState,
+    mcp: &mut McpPolicy,
     infos: &[RuntimeInfo],
     out: &mut Intents,
 ) {
@@ -741,11 +931,46 @@ fn edit_tab(
             .desired_rows(4)
             .desired_width(f32::INFINITY),
     );
+    ui.add_space(6.0);
+    ui.label(RichText::new(v.tr.t("team.effortLevel.label")).color(theme::TEXT_2));
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(edit.effort.is_none(), v.tr.t("rteams.launch.effortDefault"))
+            .clicked()
+        {
+            edit.effort = None;
+        }
+        for e in EFFORTS {
+            let picked = edit.effort.as_deref() == Some(e);
+            if ui
+                .selectable_label(picked, v.tr.t(&format!("rteams.launch.effort.{e}")))
+                .clicked()
+            {
+                edit.effort = Some(e.to_string());
+            }
+        }
+    });
+    ui.checkbox(
+        &mut edit.fast,
+        v.tr.t("team.modelSelector.fastMode.optionalLabel"),
+    )
+    .on_hover_text(v.tr.t("rteams.launch.fastHint"));
+    ui.label(RichText::new(v.tr.t("rteams.launch.limit")).color(theme::TEXT_2));
+    ui.add(
+        egui::TextEdit::singleline(&mut edit.limit)
+            .hint_text(v.tr.t("rteams.launch.limitHint"))
+            .desired_width(180.0),
+    );
+    let bad_limit = parse_limit(&edit.limit).is_err();
+    if bad_limit {
+        ui.label(RichText::new(v.tr.t("rteams.launch.badLimit")).color(theme::ERROR));
+    }
     ui.add_space(8.0);
     let update = edit.update(v, name);
     let rt_cmd = edit.runtime_cmd(v, name);
+    let launch_cmd = edit.launch_cmd(v, name);
     ui.horizontal(|ui| {
-        let ready = can_write && (update.is_some() || rt_cmd.is_some());
+        let ready = can_write && (update.is_some() || rt_cmd.is_some() || launch_cmd.is_some());
         if ui
             .add_enabled_ui(ready, |ui| {
                 theme::solid(ui, &v.tr.t("common.actions.save"), theme::INFO)
@@ -753,7 +978,7 @@ fn edit_tab(
             .inner
             .clicked()
         {
-            for cmd in update.into_iter().chain(rt_cmd) {
+            for cmd in update.into_iter().chain(rt_cmd).chain(launch_cmd) {
                 out.push(Intent::Run(cmd));
             }
         }
@@ -764,6 +989,27 @@ fn edit_tab(
     ui.add_space(10.0);
     theme::rule(ui);
     ui.add_space(8.0);
+    if !removed {
+        let m = v.members().iter().find(|m| m.name == name);
+        mcp.load(
+            name,
+            m.and_then(|m| m.runtime.as_deref()),
+            m.map_or(&[], |m| m.mcp_allow.as_slice()),
+            v.team()
+                .and_then(|t| t.project_path.as_deref())
+                .filter(|p| !p.trim().is_empty())
+                .map(std::path::PathBuf::from),
+        );
+        if let Some(allow) = mcp.show(ui, v.tr, can_write) {
+            out.push(Intent::Run(GuiCmd::SetMemberMcp {
+                name: name.to_string(),
+                allow,
+            }));
+        }
+        ui.add_space(10.0);
+        theme::rule(ui);
+        ui.add_space(8.0);
+    }
     if removed {
         if theme::solid(ui, &v.tr.t("team.kanban.trash.restore"), theme::SUCCESS).clicked() {
             out.push(Intent::Run(GuiCmd::RemoveMember {
@@ -885,6 +1131,7 @@ mod tests {
                 Tab::Messages,
                 Tab::Stats,
                 Tab::Sessions,
+                Tab::Changes,
                 Tab::Edit,
             ] {
                 let mut d = MemberDialog::default();
@@ -922,6 +1169,23 @@ mod tests {
             }) => assert_eq!(m, "opus"),
             other => panic!("{other:?}"),
         }
+        // Launch settings: prefilled from the member, diffed into SetMemberLaunch.
+        assert!(d.edit.launch_cmd(&view, "ada").is_none());
+        d.edit.effort = Some("high".into());
+        d.edit.fast = true;
+        d.edit.limit = "200,000".into();
+        assert_eq!(
+            d.edit.launch_cmd(&view, "ada"),
+            Some(GuiCmd::SetMemberLaunch {
+                name: "ada".into(),
+                effort: Some("high".into()),
+                fast: Some(true),
+                context_limit: Some(200_000),
+            })
+        );
+        d.edit.limit = "abc".into();
+        assert!(d.edit.launch_cmd(&view, "ada").is_none());
+        render(|ui| d.show(ui.ctx(), &view, &mut Intents::default()));
         d.edit.confirm_remove = true;
         render(|ui| d.show(ui.ctx(), &view, &mut Intents::default()));
         let _ = std::fs::remove_dir_all(home);

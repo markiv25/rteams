@@ -49,6 +49,7 @@ pub enum Command {
     Comment {
         task: String,
         text: String,
+        attachments: Vec<crate::Attachment>,
     },
     RequestReview {
         task: String,
@@ -69,6 +70,9 @@ pub enum Command {
         mode: Option<String>,
         /// Sender's team for a cross-team message.
         from_team: Option<String>,
+        /// Group chat id (the message goes to that chat; `to` must be `None`).
+        chat: Option<String>,
+        attachments: Vec<crate::Attachment>,
     },
     /// `None` leaves a field unchanged.
     ConfigureTeam {
@@ -85,6 +89,13 @@ pub enum Command {
         worktree: Option<bool>,
         /// Avatar icon; `Some("")` clears it back to the default.
         icon: Option<String>,
+        /// low | medium | high; `Some("")` clears.
+        effort: Option<String>,
+        fast: Option<bool>,
+        /// `Some(0)` clears.
+        context_limit: Option<u32>,
+        /// Replaces the whole list.
+        mcp_allow: Option<Vec<String>>,
     },
     /// Soft remove (`true`) or restore (`false`).
     RemoveMember {
@@ -127,6 +138,10 @@ pub enum Command {
     DeleteTeam {
         deleted: bool,
     },
+    /// Change the team's display name. The directory (team id) never changes.
+    RenameTeam {
+        name: String,
+    },
     /// Toggle: the same actor + emoji twice removes the reaction.
     React {
         message_seq: u64,
@@ -149,5 +164,54 @@ pub enum Command {
         id: String,
         allow: bool,
         note: Option<String>,
+    },
+    CreateGroupChat {
+        id: String,
+        name: String,
+        members: Vec<String>,
+    },
+    UpdateGroupChat {
+        id: String,
+        name: Option<String>,
+        members: Option<Vec<String>>,
+    },
+    DeleteGroupChat {
+        id: String,
+    },
+    AddReviewer {
+        task: String,
+        reviewer: String,
+    },
+    RemoveReviewer {
+        task: String,
+        reviewer: String,
+    },
+    /// Unarchive (the original's tool name).
+    RestoreTask {
+        task: String,
+    },
+    /// Move a task to a kanban column (status in snake_case) along legal transitions.
+    SetColumn {
+        task: String,
+        column: String,
+    },
+    /// Archive every task in a column (approved or done only).
+    ClearColumn {
+        column: String,
+    },
+    /// status: starting | ready | working | idle | stuck.
+    Heartbeat {
+        member: String,
+        status: String,
+        task: Option<String>,
+        note: Option<String>,
+    },
+    /// Ask the shell to launch these members (empty = everyone).
+    LaunchRequest {
+        members: Vec<String>,
+    },
+    /// Ask the shell to stop these members (empty = everyone).
+    StopRequest {
+        members: Vec<String>,
     },
 }

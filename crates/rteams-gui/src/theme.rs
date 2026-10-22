@@ -796,6 +796,10 @@ mod tests {
                     runtime: None,
                     worktree: false,
                     icon: None,
+                    effort: None,
+                    fast: false,
+                    context_limit: None,
+                    mcp_allow: vec![],
                 },
                 rteams_core::Member {
                     name: "ada".into(),
@@ -806,6 +810,10 @@ mod tests {
                     runtime: None,
                     worktree: false,
                     icon: None,
+                    effort: None,
+                    fast: false,
+                    context_limit: None,
+                    mcp_allow: vec![],
                 },
             ],
             project_path: None,
@@ -813,6 +821,7 @@ mod tests {
             deleted: false,
             column_order: Default::default(),
             schedules: vec![],
+            group_chats: vec![],
         };
         assert_eq!(member_color(Some(&team), "boss"), LEAD_COLOR);
         assert_eq!(member_color(Some(&team), "ada"), PALETTE[0]);

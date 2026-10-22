@@ -464,6 +464,8 @@ mod tests {
                 text: "hi".into(),
                 mode: None,
                 from_team: None,
+                attachments: vec![],
+                chat: None,
             },
             &|_| Ok(()),
         )

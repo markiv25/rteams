@@ -269,7 +269,9 @@ fn lookups_and_membership_are_validated() {
                 mode: None,
                 to: Some("ghost".into()),
                 text: "hi".into(),
-                from_team: None
+                from_team: None,
+                attachments: vec![],
+                chat: None,
             }
         ),
         Err(CoreError::UnknownMember("ghost".into()))
@@ -333,6 +335,7 @@ fn replay_matches_incremental_state_and_seq_is_gapless() {
         Command::Comment {
             task: "a".into(),
             text: "hi".into(),
+            attachments: vec![],
         },
     );
     f.run("echo", review_cmd("a"));
@@ -470,6 +473,10 @@ fn update_member() {
             runtime: None,
             worktree: None,
             icon: None,
+            effort: None,
+            fast: None,
+            context_limit: None,
+            mcp_allow: None,
         },
     );
     let m = f
@@ -495,6 +502,10 @@ fn update_member() {
         runtime: None,
         worktree: None,
         icon: None,
+        effort: None,
+        fast: None,
+        context_limit: None,
+        mcp_allow: None,
     };
     assert_eq!(
         f.try_run("lead", upd("ghost", None)),
@@ -515,6 +526,10 @@ fn update_member() {
                 runtime: None,
                 worktree: None,
                 icon: None,
+                effort: None,
+                fast: None,
+                context_limit: None,
+                mcp_allow: None,
             }
         ),
         Err(CoreError::EmptyMemberUpdate)
@@ -561,6 +576,8 @@ fn remove_and_restore_member() {
                 to: Some("echo".into()),
                 text: "x".into(),
                 from_team: None,
+                attachments: vec![],
+                chat: None,
             }
         ),
         Err(CoreError::UnknownMember("echo".into()))
@@ -620,6 +637,10 @@ fn cannot_remove_last_lead_but_can_with_another() {
             runtime: None,
             worktree: None,
             icon: None,
+            effort: None,
+            fast: None,
+            context_limit: None,
+            mcp_allow: None,
         },
     );
     f.run("lead", remove("lead", true));
@@ -638,6 +659,8 @@ fn message_mode_is_validated_and_carried() {
         text: "x".into(),
         mode: mode.map(Into::into),
         from_team: None,
+        attachments: vec![],
+        chat: None,
     };
     assert_eq!(
         f.try_run("echo", send(Some("shout"))),
@@ -689,6 +712,10 @@ fn member_icon_set_and_reset() {
         runtime: None,
         worktree: None,
         icon: Some(i.into()),
+        effort: None,
+        fast: None,
+        context_limit: None,
+        mcp_allow: None,
     };
     assert_eq!(icon(&f), None);
     f.run("lead", set(" 🚀 "));
@@ -696,4 +723,27 @@ fn member_icon_set_and_reset() {
     // An icon alone is a valid update; the empty string resets to the default.
     f.run("lead", set(""));
     assert_eq!(icon(&f), None);
+}
+
+#[test]
+fn rename_team() {
+    let mut f = Fixture::new();
+    f.run(
+        "lead",
+        Command::RenameTeam {
+            name: "  New Name ".into(),
+        },
+    );
+    assert_eq!(f.store.state().team.as_ref().unwrap().name, "New Name");
+    assert_eq!(
+        f.try_run("lead", Command::RenameTeam { name: "   ".into() }),
+        Err(CoreError::EmptyField("team name"))
+    );
+    let empty = rteams_core::MemStore::new();
+    assert_eq!(
+        empty
+            .state()
+            .decide(Command::RenameTeam { name: "x".into() }),
+        Err(CoreError::TeamNotCreated)
+    );
 }

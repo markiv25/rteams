@@ -198,6 +198,9 @@ impl AgentRuntime for OpenCode {
     fn session_id(&self, line: &str) -> Option<String> {
         session_field(&serde_json::from_str::<Value>(line).ok()?)
     }
+    fn login_command(&self) -> Option<&'static str> {
+        Some("opencode auth login")
+    }
     fn supports_resume(&self) -> bool {
         true
     }

@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::command::Command;
 use crate::domain::{
-    Attachment, Member, Message, PermissionRequest, ProcessEntry, Reaction, Scope, Task, Team,
+    Attachment, GroupChat, HeartbeatInfo, Member, Message, PermissionRequest, ProcessEntry,
+    Reaction, Scope, Task, Team,
 };
 use crate::error::CoreError;
 use crate::event::{Event, EventKind};
@@ -21,6 +22,8 @@ pub struct State {
     pub processes: Vec<ProcessEntry>,
     /// Tool-approval requests, in request order.
     pub permissions: Vec<PermissionRequest>,
+    /// Last heartbeat per member.
+    pub heartbeats: BTreeMap<String, HeartbeatInfo>,
 }
 
 impl State {
@@ -119,6 +122,7 @@ impl State {
                     deleted: false,
                     column_order: Default::default(),
                     schedules: vec![],
+                    group_chats: vec![],
                 });
             }
             MemberAdded {
@@ -136,6 +140,10 @@ impl State {
                         runtime: runtime.clone(),
                         worktree: false,
                         icon: None,
+                        effort: None,
+                        fast: false,
+                        context_limit: None,
+                        mcp_allow: vec![],
                     });
                 }
             }
@@ -160,8 +168,24 @@ impl State {
                 runtime,
                 worktree,
                 icon,
+                effort,
+                fast,
+                context_limit,
+                mcp_allow,
             } => {
                 if let Some(m) = self.member_mut(name) {
+                    if let Some(x) = effort {
+                        m.effort = (!x.trim().is_empty()).then(|| x.trim().to_string());
+                    }
+                    if let Some(f) = fast {
+                        m.fast = *f;
+                    }
+                    if let Some(c) = context_limit {
+                        m.context_limit = (*c > 0).then_some(*c);
+                    }
+                    if let Some(l) = mcp_allow {
+                        m.mcp_allow = l.clone();
+                    }
                     if let Some(i) = icon {
                         m.icon = (!i.trim().is_empty()).then(|| i.trim().to_string());
                     }
@@ -203,6 +227,7 @@ impl State {
                     status: Status::Pending,
                     blocked_by: blocked_by.clone(),
                     reviewer: None,
+                    reviewers: vec![],
                     blocked_from: None,
                     blocked_reason: None,
                     archived: false,
@@ -262,8 +287,15 @@ impl State {
                     t.archived = *archived;
                 }
             }
-            TaskCommented { task, text } => {
+            TaskCommented {
+                task,
+                text,
+                attachments,
+            } => {
                 self.push_message(seq, ts, e, Scope::Task { task: task.clone() }, text.clone());
+                if let Some(m) = self.messages.last_mut() {
+                    m.attachments = attachments.clone();
+                }
             }
             ReviewRequested { task, reviewer } => {
                 if let Some(t) = self.task_mut(task) {
@@ -299,15 +331,19 @@ impl State {
                 text,
                 mode,
                 from_team,
+                chat,
+                attachments,
             } => {
-                let scope = match to {
-                    Some(to) => Scope::Direct { to: to.clone() },
-                    None => Scope::Broadcast,
+                let scope = match (chat, to) {
+                    (Some(chat), _) => Scope::Group { chat: chat.clone() },
+                    (None, Some(to)) => Scope::Direct { to: to.clone() },
+                    (None, None) => Scope::Broadcast,
                 };
                 self.push_message(seq, ts, e, scope, text.clone());
                 if let Some(m) = self.messages.last_mut() {
                     m.mode = mode.clone();
                     m.from_team = from_team.clone();
+                    m.attachments = attachments.clone();
                 }
             }
             ProcessRegistered {
@@ -370,6 +406,11 @@ impl State {
                     t.column_order.insert(column.clone(), order.clone());
                 }
             }
+            TeamRenamed { name } => {
+                if let Some(t) = &mut self.team {
+                    t.name = name.clone();
+                }
+            }
             TeamDeleted { deleted } => {
                 if let Some(t) = &mut self.team {
                     t.deleted = *deleted;
@@ -420,6 +461,77 @@ impl State {
                     p.note = note.clone();
                 }
             }
+            GroupChatCreated { id, name, members } => {
+                if let Some(t) = &mut self.team {
+                    t.group_chats.push(GroupChat {
+                        id: id.clone(),
+                        name: name.clone(),
+                        members: members.clone(),
+                        created_by: e.actor.clone(),
+                    });
+                }
+            }
+            GroupChatUpdated { id, name, members } => {
+                if let Some(g) = self
+                    .team
+                    .as_mut()
+                    .and_then(|t| t.group_chats.iter_mut().find(|g| g.id == *id))
+                {
+                    if let Some(n) = name {
+                        g.name = n.clone();
+                    }
+                    if let Some(m) = members {
+                        g.members = m.clone();
+                    }
+                }
+            }
+            GroupChatDeleted { id } => {
+                if let Some(t) = &mut self.team {
+                    t.group_chats.retain(|g| g.id != *id);
+                }
+            }
+            ReviewerAdded { task, reviewer } => {
+                if let Some(t) = self.task_mut(task) {
+                    if !t.reviewers.contains(reviewer) {
+                        t.reviewers.push(reviewer.clone());
+                    }
+                }
+            }
+            ReviewerRemoved { task, reviewer } => {
+                if let Some(t) = self.task_mut(task) {
+                    t.reviewers.retain(|r| r != reviewer);
+                }
+            }
+            TaskColumnSet { task, to, .. } => {
+                if let Some(t) = self.task_mut(task) {
+                    t.status = *to;
+                    t.review_started = false;
+                }
+            }
+            ColumnCleared { tasks, .. } => {
+                for id in tasks {
+                    if let Some(t) = self.task_mut(id) {
+                        t.archived = true;
+                    }
+                }
+            }
+            MemberHeartbeat {
+                member,
+                status,
+                task,
+                note,
+            } => {
+                self.heartbeats.insert(
+                    member.clone(),
+                    HeartbeatInfo {
+                        status: status.clone(),
+                        task: task.clone(),
+                        note: note.clone(),
+                        ts,
+                    },
+                );
+            }
+            LaunchRequested { .. } | StopRequested { .. } => {}
         }
     }
 
@@ -433,6 +545,7 @@ impl State {
             mode: None,
             from_team: None,
             reactions: vec![],
+            attachments: vec![],
         });
     }
 
@@ -446,6 +559,15 @@ impl State {
     fn require_task(&self, id: &str) -> Result<&Task, CoreError> {
         self.task(id)
             .ok_or_else(|| CoreError::TaskNotFound(id.to_string()))
+    }
+
+    pub fn group(&self, id: &str) -> Option<&GroupChat> {
+        self.team.as_ref()?.group_chats.iter().find(|g| g.id == id)
+    }
+
+    fn require_group(&self, id: &str) -> Result<&GroupChat, CoreError> {
+        self.group(id)
+            .ok_or_else(|| CoreError::GroupChatNotFound(id.to_string()))
     }
 
     fn require_member(&self, name: &str) -> Result<(), CoreError> {
@@ -613,9 +735,18 @@ impl State {
                 self.require_task(&task)?;
                 Ok(E::TaskArchived { task, archived })
             }
-            C::Comment { task, text } => {
+            C::Comment {
+                task,
+                text,
+                attachments,
+            } => {
                 self.require_task(&task)?;
-                Ok(E::TaskCommented { task, text })
+                check_attachments(&attachments)?;
+                Ok(E::TaskCommented {
+                    task,
+                    text,
+                    attachments,
+                })
             }
             C::RequestReview { task, reviewer } => {
                 let t = self.require_task(&task)?;
@@ -636,10 +767,19 @@ impl State {
                 text,
                 mode,
                 from_team,
+                chat,
+                attachments,
             } => {
                 if let Some(to) = &to {
                     self.require_member(to)?;
                 }
+                if let Some(chat) = &chat {
+                    if to.is_some() {
+                        return Err(CoreError::ChatWithRecipient);
+                    }
+                    self.require_group(chat)?;
+                }
+                check_attachments(&attachments)?;
                 if let Some(m) = &mode {
                     if !matches!(m.as_str(), "do" | "ask" | "delegate") {
                         return Err(CoreError::InvalidMode(m.clone()));
@@ -650,6 +790,8 @@ impl State {
                     text,
                     mode,
                     from_team,
+                    chat,
+                    attachments,
                 })
             }
             C::ConfigureTeam {
@@ -675,6 +817,10 @@ impl State {
                 runtime,
                 worktree,
                 icon,
+                effort,
+                fast,
+                context_limit,
+                mcp_allow,
             } => {
                 self.require_member(&name)?;
                 if role.is_none()
@@ -683,10 +829,21 @@ impl State {
                     && runtime.is_none()
                     && worktree.is_none()
                     && icon.is_none()
+                    && effort.is_none()
+                    && fast.is_none()
+                    && context_limit.is_none()
+                    && mcp_allow.is_none()
                 {
                     return Err(CoreError::EmptyMemberUpdate);
                 }
                 check_runtime(&runtime)?;
+                if let Some(x) = &effort {
+                    let x = x.trim();
+                    if !x.is_empty() && !matches!(x, "low" | "medium" | "high") {
+                        return Err(CoreError::InvalidEffort(x.to_string()));
+                    }
+                }
+                let mcp_allow = mcp_allow.map(dedup);
                 if role.as_ref().is_some_and(|r| r.trim().is_empty()) {
                     return Err(CoreError::EmptyRole);
                 }
@@ -704,6 +861,10 @@ impl State {
                     runtime,
                     worktree,
                     icon,
+                    effort,
+                    fast,
+                    context_limit,
+                    mcp_allow,
                 })
             }
             C::RemoveMember { name, removed } => {
@@ -801,6 +962,16 @@ impl State {
                     order: dedup(order),
                 })
             }
+            C::RenameTeam { name } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return Err(CoreError::EmptyField("team name"));
+                }
+                if self.team.is_none() {
+                    return Err(CoreError::TeamNotCreated);
+                }
+                Ok(E::TeamRenamed { name })
+            }
             C::DeleteTeam { deleted } => {
                 if self.team.is_none() {
                     return Err(CoreError::TeamNotCreated);
@@ -872,8 +1043,195 @@ impl State {
                     Some(_) => Ok(E::PermissionDecided { id, allow, note }),
                 }
             }
+            C::CreateGroupChat { id, name, members } => {
+                if self.team.is_none() {
+                    return Err(CoreError::TeamNotCreated);
+                }
+                if id.trim().is_empty() {
+                    return Err(CoreError::EmptyField("group chat id"));
+                }
+                if name.trim().is_empty() {
+                    return Err(CoreError::EmptyField("group chat name"));
+                }
+                if self.group(&id).is_some() {
+                    return Err(CoreError::GroupChatExists(id));
+                }
+                for m in &members {
+                    self.require_member(m)?;
+                }
+                Ok(E::GroupChatCreated {
+                    id,
+                    name,
+                    members: dedup(members),
+                })
+            }
+            C::UpdateGroupChat { id, name, members } => {
+                self.require_group(&id)?;
+                if name.is_none() && members.is_none() {
+                    return Err(CoreError::EmptyGroupUpdate);
+                }
+                if name.as_ref().is_some_and(|n| n.trim().is_empty()) {
+                    return Err(CoreError::EmptyField("group chat name"));
+                }
+                if let Some(ms) = &members {
+                    for m in ms {
+                        self.require_member(m)?;
+                    }
+                }
+                Ok(E::GroupChatUpdated {
+                    id,
+                    name,
+                    members: members.map(dedup),
+                })
+            }
+            C::DeleteGroupChat { id } => {
+                self.require_group(&id)?;
+                Ok(E::GroupChatDeleted { id })
+            }
+            C::AddReviewer { task, reviewer } => {
+                let t = self.require_task(&task)?;
+                self.require_member(&reviewer)?;
+                if t.reviewer.as_deref() == Some(reviewer.as_str())
+                    || t.reviewers.contains(&reviewer)
+                {
+                    return Err(CoreError::ReviewerExists { task, reviewer });
+                }
+                Ok(E::ReviewerAdded { task, reviewer })
+            }
+            C::RemoveReviewer { task, reviewer } => {
+                let t = self.require_task(&task)?;
+                if !t.reviewers.contains(&reviewer) {
+                    return Err(CoreError::ReviewerNotFound { task, reviewer });
+                }
+                Ok(E::ReviewerRemoved { task, reviewer })
+            }
+            C::RestoreTask { task } => {
+                if !self.require_task(&task)?.archived {
+                    return Err(CoreError::NotArchived(task));
+                }
+                Ok(E::TaskArchived {
+                    task,
+                    archived: false,
+                })
+            }
+            C::SetColumn { task, column } => {
+                let t = self.require_task(&task)?;
+                let to =
+                    serde_json::from_value::<Status>(serde_json::Value::String(column.clone()))
+                        .map_err(|_| CoreError::UnknownColumn(column.clone()))?;
+                if matches!(to, Status::NeedsFix | Status::Blocked) {
+                    return Err(CoreError::UseDedicatedCommand { task, to });
+                }
+                if t.status == Status::Blocked || !status_path_exists(t.status, to) {
+                    return Err(CoreError::NoPath {
+                        task,
+                        from: t.status,
+                        to,
+                    });
+                }
+                Ok(E::TaskColumnSet {
+                    task,
+                    from: t.status,
+                    to,
+                })
+            }
+            C::ClearColumn { column } => {
+                let st =
+                    serde_json::from_value::<Status>(serde_json::Value::String(column.clone()))
+                        .map_err(|_| CoreError::UnknownColumn(column.clone()))?;
+                if !matches!(st, Status::Approved | Status::Done) {
+                    return Err(CoreError::ColumnNotClearable(column));
+                }
+                let tasks: Vec<String> = self
+                    .tasks
+                    .iter()
+                    .filter(|t| !t.archived && t.status == st)
+                    .map(|t| t.id.clone())
+                    .collect();
+                if tasks.is_empty() {
+                    return Err(CoreError::ColumnEmpty(column));
+                }
+                Ok(E::ColumnCleared { column, tasks })
+            }
+            C::Heartbeat {
+                member,
+                status,
+                task,
+                note,
+            } => {
+                self.require_member(&member)?;
+                if !matches!(
+                    status.as_str(),
+                    "starting" | "ready" | "working" | "idle" | "stuck"
+                ) {
+                    return Err(CoreError::InvalidHeartbeat(status));
+                }
+                if let Some(t) = &task {
+                    self.require_task(t)?;
+                }
+                Ok(E::MemberHeartbeat {
+                    member,
+                    status,
+                    task,
+                    note,
+                })
+            }
+            C::LaunchRequest { members } => {
+                for m in &members {
+                    self.require_member(m)?;
+                }
+                Ok(E::LaunchRequested {
+                    members: dedup(members),
+                })
+            }
+            C::StopRequest { members } => {
+                for m in &members {
+                    self.require_member(m)?;
+                }
+                Ok(E::StopRequested {
+                    members: dedup(members),
+                })
+            }
         }
     }
+}
+
+fn check_attachments(list: &[Attachment]) -> Result<(), CoreError> {
+    for a in list {
+        if a.name.trim().is_empty() {
+            return Err(CoreError::EmptyField("attachment name"));
+        }
+        if a.path.trim().is_empty() {
+            return Err(CoreError::EmptyField("attachment path"));
+        }
+    }
+    Ok(())
+}
+
+/// True if `to` is reachable from `from` over legal edges without passing through Blocked/NeedsFix
+/// (those have dedicated commands) and `from != to`.
+fn status_path_exists(from: Status, to: Status) -> bool {
+    if from == to {
+        return false;
+    }
+    let mut seen = vec![from];
+    let mut q = VecDeque::from([from]);
+    while let Some(s) = q.pop_front() {
+        for n in Status::ALL {
+            if matches!(n, Status::Blocked | Status::NeedsFix)
+                || seen.contains(&n)
+                || !s.can_transition_to(n)
+            {
+                continue;
+            }
+            if n == to {
+                return true;
+            }
+            seen.push(n);
+            q.push_back(n);
+        }
+    }
+    false
 }
 
 fn check_runtime(runtime: &Option<String>) -> Result<(), CoreError> {

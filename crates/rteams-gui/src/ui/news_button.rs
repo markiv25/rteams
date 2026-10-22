@@ -11,7 +11,7 @@ use super::news_dialog::NewsDialog;
 use super::update_dialog::open_link;
 use super::FeatureCtx;
 use crate::theme;
-use rteams_services::announcements::{self, policy, Model};
+use rteams_services::announcements::{self, Model};
 use rteams_services::config::AppConfig;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -61,13 +61,7 @@ impl NewsButton {
                 self.model = m;
                 if !self.auto_opened {
                     self.auto_opened = true;
-                    if let Some(a) = policy::select_auto(
-                        &self.model.items,
-                        &self.model.state,
-                        now_ms(),
-                        APP_VERSION,
-                    ) {
-                        let id = a.id.clone();
+                    if let Some(id) = self.model.claim_auto(home, now_ms(), APP_VERSION) {
                         self.dialog.open_article(&id);
                     }
                 }

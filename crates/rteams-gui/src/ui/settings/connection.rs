@@ -26,6 +26,13 @@ pub struct State {
     remote: Option<(String, Result<Vec<String>, String>)>,
     remote_host: String,
     config_hosts: Option<Vec<String>>,
+    /// Expanded `~/.ssh/config` text (Include resolved) for resolving a picked alias.
+    config_text: String,
+    /// Profile id of the last connection that worked (persisted in `ssh-last.json`).
+    last_id: Option<String>,
+    last_loaded: bool,
+    /// Profile id the in-flight test/connect belongs to.
+    pending_id: String,
     error: Option<String>,
 }
 
@@ -60,24 +67,35 @@ pub fn show(
         st.profiles = Some(ssh::load_profiles(home));
     }
     if st.config_hosts.is_none() {
-        st.config_hosts = Some(
-            rteams_services::claude_root::user_home()
-                .and_then(|h| std::fs::read_to_string(h.join(".ssh/config")).ok())
-                .map(|t: String| ssh::parse_config_hosts(&t))
-                .unwrap_or_default(),
-        );
+        st.config_text = rteams_services::claude_root::user_home()
+            .map(|h| ssh::load_user_config(&h))
+            .unwrap_or_default();
+        st.config_hosts = Some(ssh::parse_config_hosts(&st.config_text));
     }
+    if !st.last_loaded {
+        st.last_loaded = true;
+        st.last_id = ssh::load_last_connection(home);
+    }
+    let mut worked = false;
     if let Some(rx) = &st.test_rx {
         if let Ok(r) = rx.try_recv() {
+            worked |= r.is_ok();
             st.test_result = Some(r);
             st.test_rx = None;
         }
     }
     if let Some(rx) = &st.remote_rx {
         if let Ok(r) = rx.try_recv() {
+            worked |= r.is_ok();
             st.remote = Some((st.remote_host.clone(), r));
             st.remote_rx = None;
         }
+    }
+    if worked
+        && !st.pending_id.is_empty()
+        && ssh::save_last_connection(home, &st.pending_id).is_ok()
+    {
+        st.last_id = Some(st.pending_id.clone());
     }
     if st.test_rx.is_some() || st.remote_rx.is_some() {
         ui.ctx()
@@ -132,6 +150,9 @@ pub fn show(
         for (i, p) in profiles.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&p.name).strong());
+                if st.last_id.as_deref() == Some(p.id.as_str()) {
+                    hint(ui, "(last connection)");
+                }
                 hint(ui, &format!("{}:{}", p.target(), p.port));
                 if ui
                     .small_button(tr.t("settings.connection.actions.testConnection"))
@@ -162,6 +183,7 @@ pub fn show(
         if let Some(p) = test {
             let (tx, rx) = mpsc::channel();
             st.test_rx = Some(rx);
+            st.pending_id = p.id.clone();
             st.test_result = None;
             std::thread::spawn(move || {
                 let _ = tx.send(ssh::test_connection(&p));
@@ -170,6 +192,7 @@ pub fn show(
         if let Some(p) = connect {
             let (tx, rx) = mpsc::channel();
             st.remote_rx = Some(rx);
+            st.pending_id = p.id.clone();
             st.remote_host = p.name.clone();
             st.remote = None;
             std::thread::spawn(move || {
@@ -282,7 +305,22 @@ pub fn show(
                     .show_ui(ui, |ui| {
                         for h in hosts {
                             if ui.selectable_label(p.host == *h, h).clicked() {
-                                p.host = h.clone();
+                                // Keep the alias as the host (ssh applies the config itself) and
+                                // pre-fill what the config says.
+                                match ssh::resolve_host(&st.config_text, h) {
+                                    Some(r) => {
+                                        let n = ssh::profile_from_host(&r);
+                                        p.host = n.host;
+                                        p.port = n.port;
+                                        p.user = n.user;
+                                        p.auth = Auth::Auto;
+                                        p.key_path = n.key_path;
+                                        if p.name.trim().is_empty() {
+                                            p.name = n.name;
+                                        }
+                                    }
+                                    None => p.host = h.clone(),
+                                }
                             }
                         }
                     });

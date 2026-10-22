@@ -144,7 +144,7 @@ impl WakeScheduler {
                         ));
                     }
                 }
-                EventKind::TaskCommented { task, text } => {
+                EventKind::TaskCommented { task, text, .. } => {
                     if let Some(o) = owner_of(task) {
                         out.push((
                             o,
@@ -343,6 +343,8 @@ mod tests {
                 text: text.into(),
                 mode: None,
                 from_team: None,
+                attachments: vec![],
+                chat: None,
             },
         )
     }
@@ -492,6 +494,7 @@ mod tests {
             EventKind::TaskCommented {
                 task: "1".into(),
                 text: "nit".into(),
+                attachments: vec![],
             },
         ));
         evs.push(ev(
@@ -500,6 +503,7 @@ mod tests {
             EventKind::TaskCommented {
                 task: "1".into(),
                 text: "own".into(),
+                attachments: vec![],
             },
         ));
         let mut s = WakeScheduler::new();

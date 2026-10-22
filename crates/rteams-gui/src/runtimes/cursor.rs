@@ -74,10 +74,11 @@ impl AgentRuntime for Cursor {
     }
     fn build_command(&self, ctx: &LaunchCtx) -> Command {
         // Best effort: a failure here surfaces as the agent lacking the rteams tools.
-        let _ = write_mcp_servers_file(
+        let _ = write_mcp_servers_file_with(
             &ctx.workdir,
             ".cursor/mcp.json",
             mcp_server_entry(ctx, false),
+            &ctx.extra_mcp,
         );
         let mut c = base_command(ctx);
         c.arg("-p")
@@ -137,6 +138,9 @@ impl AgentRuntime for Cursor {
             Some("system") | Some("result") => session_field(&v),
             _ => None,
         }
+    }
+    fn login_command(&self) -> Option<&'static str> {
+        Some("cursor-agent login")
     }
     fn supports_resume(&self) -> bool {
         true
