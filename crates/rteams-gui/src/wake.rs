@@ -14,6 +14,12 @@ pub const MIN_GAP_MS: i64 = 20_000;
 /// Max wakes per member per rolling hour.
 pub const MAX_PER_HOUR: usize = 6;
 const HOUR_MS: i64 = 3_600_000;
+/// Follow-up wakes in a row (no new event for the member in between) before we stop and wait.
+pub const MAX_FOLLOW_UPS: u32 = 5;
+/// Hourly wakes kept free for real events: follow-ups may not use the last ones.
+const RESERVED_FOR_EVENTS: usize = 2;
+/// Fixed follow-up reason; the prompt's task list (fresh at launch) says which tasks.
+pub const FOLLOW_UP_REASON: &str = "follow-up: continue with your open tasks listed below";
 /// Soft size budget for a prompt, in bytes.
 pub const PROMPT_BUDGET: usize = 1_500;
 
@@ -30,6 +36,8 @@ struct Pending {
     last_ms: i64,
     /// Mode of the latest triggering message, if any.
     mode: Option<String>,
+    /// Only a follow-up reason so far (no message/task/review event): lower priority.
+    follow_up: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +57,10 @@ pub struct WakeScheduler {
     wakes: HashMap<String, Vec<i64>>,
     /// Event cursor at each member's last wake; the inbox is shown from here.
     woken_at_seq: HashMap<String, u64>,
+    /// Each member's actionable queue (task, status) when its current run started.
+    run_start: HashMap<String, Vec<(String, String)>>,
+    /// Follow-up wakes since the member last had a real reason (message, task, review...).
+    follow_ups: HashMap<String, u32>,
 }
 
 impl WakeScheduler {
@@ -164,6 +176,7 @@ impl WakeScheduler {
                     continue;
                 }
                 let p = self.pending.entry(member).or_default();
+                p.follow_up = false;
                 p.reasons.push(reason);
                 p.last_ms = p.last_ms.max(now_ms);
                 if mode_of.is_some() {
@@ -185,7 +198,9 @@ impl WakeScheduler {
     ) -> Vec<WakeOrder> {
         let mut slots = max_concurrent.saturating_sub(running_count);
         let mut orders = Vec::new();
-        let names: Vec<String> = self.pending.keys().cloned().collect();
+        // real reasons (messages, tasks, reviews) before follow-ups
+        let mut names: Vec<String> = self.pending.keys().cloned().collect();
+        names.sort_by_key(|m| self.pending[m].follow_up);
         for m in names {
             if slots == 0 {
                 break;
@@ -195,11 +210,19 @@ impl WakeScheduler {
             }
             let hist = self.wakes.entry(m.clone()).or_default();
             hist.retain(|t| now_ms - t < HOUR_MS);
-            if hist.len() >= MAX_PER_HOUR || hist.last().is_some_and(|t| now_ms - t < MIN_GAP_MS) {
+            let cap = if self.pending[&m].follow_up {
+                MAX_PER_HOUR - RESERVED_FOR_EVENTS
+            } else {
+                MAX_PER_HOUR
+            };
+            if hist.len() >= cap || hist.last().is_some_and(|t| now_ms - t < MIN_GAP_MS) {
                 continue;
             }
             hist.push(now_ms);
             let p = self.pending.remove(&m).unwrap_or_default();
+            if !p.follow_up {
+                self.follow_ups.remove(&m); // a real reason restarts the follow-up chain
+            }
             let after = self.woken_at_seq.get(&m).copied().unwrap_or(0);
             self.woken_at_seq.insert(m.clone(), self.cursor);
             let prompt = build_prompt_after(state, &m, &p.reasons, p.mode.as_deref(), after);
@@ -214,6 +237,54 @@ impl WakeScheduler {
         orders
     }
 
+    /// A run of `member` is starting: remember its actionable queue to measure progress.
+    pub fn note_launch(&mut self, state: &State, member: &str) {
+        self.run_start
+            .insert(member.to_string(), queue(state, member));
+    }
+
+    /// A run ended without a clean exit (stopped, failed): no follow-up for it.
+    pub fn forget_run(&mut self, member: &str) {
+        self.run_start.remove(member);
+    }
+
+    /// A run of `member` ended cleanly. When it moved its own queue (started, finished or
+    /// handed off a task) and actionable tasks remain, queue a follow-up wake so the rest does
+    /// not wait for an unrelated event. A run that only commented or messaged (e.g. waiting on
+    /// a person) is not progress, so it is never re-woken for nothing. At most MAX_FOLLOW_UPS
+    /// in a row until a real event wakes the member; follow-ups also rank below real events and
+    /// may not use the last RESERVED_FOR_EVENTS hourly wakes. Returns whether one was queued.
+    pub fn on_run_end(&mut self, state: &State, member: &str, now_ms: i64) -> bool {
+        let Some(before) = self.run_start.remove(member) else {
+            return false;
+        };
+        if !state.is_member(member) {
+            return false;
+        }
+        let now = queue(state, member);
+        if now.is_empty() || now == before {
+            return false;
+        }
+        if self.pending.contains_key(member) {
+            return false; // a real reason is already queued and will wake it
+        }
+        let n = self.follow_ups.entry(member.to_string()).or_default();
+        if *n >= MAX_FOLLOW_UPS {
+            return false;
+        }
+        *n += 1;
+        self.pending.insert(
+            member.to_string(),
+            Pending {
+                reasons: vec![FOLLOW_UP_REASON.to_string()],
+                last_ms: now_ms,
+                mode: None,
+                follow_up: true,
+            },
+        );
+        true
+    }
+
     /// Queued wakes for the UI.
     pub fn pending(&self) -> Vec<(String, Vec<String>)> {
         self.pending
@@ -221,6 +292,15 @@ impl WakeScheduler {
             .map(|(m, p)| (m.clone(), p.reasons.clone()))
             .collect()
     }
+}
+
+/// A member's actionable queue as (task, status): equal before and after a run = no progress.
+fn queue(state: &State, member: &str) -> Vec<(String, String)> {
+    briefing(state, member)
+        .actionable
+        .into_iter()
+        .map(|i| (i.task, format!("{:?}", i.status)))
+        .collect()
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -354,6 +434,144 @@ mod tests {
     fn run(evs: &[Event], sched: &mut WakeScheduler, agents: &[&str], now: i64) {
         let st = State::from_events(evs);
         sched.observe(evs, &st, &names(agents), now);
+    }
+
+    fn created(seq: u64, task: &str, owner: &str) -> Event {
+        ev(
+            seq,
+            "lead",
+            EventKind::TaskCreated {
+                task: task.into(),
+                subject: format!("work {task}"),
+                description: String::new(),
+                owner: Some(owner.into()),
+                blocked_by: vec![],
+            },
+        )
+    }
+
+    fn start(seq: u64, task: &str, who: &str) -> Event {
+        ev(
+            seq,
+            who,
+            EventKind::TaskTransitioned {
+                task: task.into(),
+                from: Status::Pending,
+                to: Status::InProgress,
+            },
+        )
+    }
+
+    #[test]
+    fn run_that_moved_its_queue_gets_a_follow_up() {
+        let mut evs = base();
+        evs.push(created(10, "1", "bob"));
+        evs.push(created(11, "2", "bob"));
+        let mut s = WakeScheduler::with_cursor(11);
+        s.note_launch(&State::from_events(&evs), "bob");
+        evs.push(start(12, "1", "bob")); // bob started #1 and exited mid-way
+        let st = State::from_events(&evs);
+        assert!(s.on_run_end(&st, "bob", 1000));
+        let o = s.due(&st, &[], 3, 0, 1000 + DEBOUNCE_MS);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].reasons, vec![FOLLOW_UP_REASON.to_string()]);
+        assert!(o[0].prompt.contains("#2"), "fresh task list in the prompt");
+    }
+
+    #[test]
+    fn comment_or_message_only_is_not_progress() {
+        let mut evs = base();
+        evs.push(created(10, "1", "bob"));
+        evs.push(start(11, "1", "bob"));
+        let mut s = WakeScheduler::with_cursor(11);
+        s.note_launch(&State::from_events(&evs), "bob");
+        // blocked on a person: comments and asks the lead, task still in progress
+        evs.push(ev(
+            12,
+            "bob",
+            EventKind::TaskCommented {
+                task: "1".into(),
+                text: "need the lead".into(),
+                attachments: vec![],
+            },
+        ));
+        evs.push(dm(13, "bob", Some("lead"), "can you check?"));
+        let st = State::from_events(&evs);
+        assert!(!s.on_run_end(&st, "bob", 0));
+        assert!(s.pending().is_empty());
+    }
+
+    #[test]
+    fn untracked_or_unclean_runs_never_follow_up() {
+        let mut evs = base();
+        evs.push(created(10, "1", "bob"));
+        evs.push(created(11, "2", "bob"));
+        let mut s = WakeScheduler::with_cursor(11);
+        let st0 = State::from_events(&evs);
+        // no note_launch: unknown start, no follow-up
+        evs.push(start(12, "1", "bob"));
+        let st = State::from_events(&evs);
+        assert!(!s.on_run_end(&st, "bob", 0));
+        // stopped/failed run is forgotten
+        s.note_launch(&st0, "bob");
+        s.forget_run("bob");
+        assert!(!s.on_run_end(&st, "bob", 0));
+        // removed mid-run: no follow-up
+        s.note_launch(&st0, "bob");
+        evs.push(ev(
+            13,
+            "lead",
+            EventKind::MemberRemoved {
+                name: "bob".into(),
+                removed: true,
+            },
+        ));
+        assert!(!s.on_run_end(&State::from_events(&evs), "bob", 0));
+    }
+
+    #[test]
+    fn follow_ups_cap_rank_below_events_and_keep_budget() {
+        let mut evs = base();
+        for i in 1..=8 {
+            evs.push(created(9 + i, &i.to_string(), "bob"));
+        }
+        let mut s = WakeScheduler::with_cursor(17);
+        let mut seq = 17;
+        let mut queued = 0;
+        for i in 1..=7 {
+            s.note_launch(&State::from_events(&evs), "bob");
+            seq += 1;
+            evs.push(start(seq, &i.to_string(), "bob"));
+            let st = State::from_events(&evs);
+            if s.on_run_end(&st, "bob", 0) {
+                queued += 1;
+                s.pending.remove("bob"); // as if launched (no real reason: chain continues)
+            }
+        }
+        assert_eq!(queued, MAX_FOLLOW_UPS);
+        // a real event for alice ranks first when slots are short
+        let st = State::from_events(&evs);
+        s.follow_ups.clear();
+        s.note_launch(&st, "bob");
+        seq += 1;
+        evs.push(start(seq, "8", "bob"));
+        let st = State::from_events(&evs);
+        assert!(s.on_run_end(&st, "bob", 0));
+        seq += 1;
+        evs.push(dm(seq, "lead", Some("alice"), "please look"));
+        let st = State::from_events(&evs);
+        s.observe(&evs, &st, &names(&["alice", "bob"]), 0);
+        let o = s.due(&st, &[], 1, 0, DEBOUNCE_MS);
+        assert_eq!(o[0].member, "alice");
+        // follow-ups may not use the reserved hourly wakes
+        let hist = s.wakes.entry("bob".into()).or_default();
+        hist.clear();
+        hist.extend((0..(MAX_PER_HOUR - RESERVED_FOR_EVENTS) as i64).map(|k| k * MIN_GAP_MS));
+        let now = (MAX_PER_HOUR as i64) * MIN_GAP_MS + DEBOUNCE_MS;
+        assert!(
+            s.due(&st, &[], 3, 0, now).is_empty(),
+            "budget kept for real events"
+        );
     }
 
     #[test]

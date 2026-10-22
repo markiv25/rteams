@@ -211,7 +211,9 @@ fn system_prompt(spec: &AgentSpec) -> String {
     let mut s = format!(
         "You are team member `{m}` (role: {r}) using the `rteams` MCP tools. Pass `{m}` as \
          `actor`/`member` on every call. Work in {d}. Be token-frugal:\n\
-         1. Call member_briefing once, then task_briefing; take the FIRST actionable task only.\n\
+         1. Call member_briefing once, then task_briefing; take the FIRST actionable task. When \
+         it is done, take the next actionable one (one task_briefing per task), at most 3 tasks \
+         per run, then stop.\n\
          2. task_start, do the work, add ONE concise task_add_comment with the result (what \
          changed, where), then task_complete (or review_request if your role/flow needs review).\n\
          3. Do NOT send messages, greetings, acknowledgements or status updates. Exceptions: \
@@ -1742,6 +1744,7 @@ mod tests {
         assert!(sp.contains("Do NOT send messages"));
         assert!(!sp.contains("inbox_get") && !sp.contains("Poll"));
         assert!(sp.lines().count() <= 12);
+        assert!(sp.contains("at most 3 tasks"));
         assert!(sp.contains("ONLY bullet points"));
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/w")));
     }

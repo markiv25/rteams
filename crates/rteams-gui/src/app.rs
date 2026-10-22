@@ -679,6 +679,10 @@ impl App {
             ),
             ..Default::default()
         };
+        // every launch path comes through here: remember the queue to measure the run's progress
+        if let Some(d) = &self.data {
+            self.wake.note_launch(d.state(), member);
+        }
         self.last = Some(
             self.supervisor
                 .launch(spec)
@@ -872,6 +876,9 @@ impl App {
                     self.supervisor.stop(&m);
                 }
                 Intent::Restart(m) => {
+                    if let Some(d) = &self.data {
+                        self.wake.note_launch(d.state(), &m);
+                    }
                     if let Err(e) = self.supervisor.restart(&m) {
                         self.last = Some(Err(e));
                     }
@@ -1189,11 +1196,16 @@ impl App {
             match &a.status {
                 AgentStatus::Running { .. } => {}
                 AgentStatus::Exited { code: Some(0) } => {
-                    recovery::note_success(&self.home, &self.team, &a.member)
+                    recovery::note_success(&self.home, &self.team, &a.member);
+                    // Remaining open tasks get a follow-up wake instead of waiting for a new event.
+                    if let Some(d) = &self.data {
+                        self.wake.on_run_end(d.state(), &a.member, now);
+                    }
                 }
-                // Stopped by the user (no code): not a failure.
-                AgentStatus::Exited { code: None } => {}
+                // Stopped by the user (no code): not a failure, and no follow-up.
+                AgentStatus::Exited { code: None } => self.wake.forget_run(&a.member),
                 status => {
+                    self.wake.forget_run(&a.member);
                     let exit_code = match status {
                         AgentStatus::Exited { code } => *code,
                         _ => None,
