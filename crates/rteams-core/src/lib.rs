@@ -16,8 +16,8 @@ pub mod store;
 
 pub use command::Command;
 pub use domain::{
-    Attachment, Member, Message, PermissionRequest, ProcessEntry, Reaction, Schedule, Scope, Task,
-    Team,
+    Attachment, GroupChat, HeartbeatInfo, Member, Message, PermissionRequest, ProcessEntry,
+    Reaction, Schedule, Scope, Task, Team,
 };
 pub use error::CoreError;
 pub use event::{Event, EventKind};

@@ -140,7 +140,7 @@ pub fn notifications(events: &[Event], since_seq: u64, me: &str) -> Vec<Note> {
                 "Task blocked".to_string(),
                 format!("{} - {}", label(task), reason),
             )),
-            EventKind::TaskCommented { task, text } if mine(task) => Some((
+            EventKind::TaskCommented { task, text, .. } if mine(task) => Some((
                 K::Comment,
                 format!("Comment from {}", e.actor),
                 format!("{}: {}", label(task), text),
@@ -257,7 +257,8 @@ mod tests {
             run(
                 vec![EventKind::TaskCommented {
                     task: "t1".into(),
-                    text: "hi".into()
+                    text: "hi".into(),
+                    attachments: vec![],
                 }],
                 "ada"
             )[0]
@@ -270,7 +271,9 @@ mod tests {
                     to: Some("boss".into()),
                     from_team: None,
                     text: "yo".into(),
-                    mode: None
+                    mode: None,
+                    attachments: vec![],
+                    chat: None,
                 }],
                 "ada"
             )[0]
@@ -282,7 +285,9 @@ mod tests {
                 to: None,
                 from_team: None,
                 text: "all".into(),
-                mode: None
+                mode: None,
+                attachments: vec![],
+                chat: None,
             }],
             "ada"
         )

@@ -133,13 +133,11 @@ fn member_briefing_errors_before_team_exists_and_for_unknown_members() {
 }
 
 #[test]
-fn work_sync_tools_do_not_exist() {
+fn work_sync_report_token_tool_does_not_exist() {
+    // status/ack and lead_briefing exist now; the token-based report stays absent.
     let s = seeded();
-    for name in [
-        "member_work_sync_status",
-        "member_work_sync_report",
-        "lead_briefing",
-    ] {
+    let name = "member_work_sync_report";
+    {
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": name, "arguments": {} } });
         let v: Value = serde_json::from_str(&s.handle_line(&req.to_string()).unwrap()).unwrap();

@@ -6,6 +6,7 @@
 //! tools/call); the tool layer in `tools` is transport-independent, so swapping in `rmcp`
 //! later only replaces this file's protocol handling.
 
+mod extra;
 mod tools;
 
 use std::io;
@@ -33,6 +34,8 @@ pub struct Server {
     /// The member this process serves (env `RTEAMS_MEMBER`); `permission_request` acts as them.
     member: Option<String>,
     permission_timeout: Duration,
+    /// Directory holding every team (for cross-team tools); `None` for in-memory servers.
+    home: Option<std::path::PathBuf>,
 }
 
 impl Default for Server {
@@ -64,7 +67,9 @@ impl Server {
 
     /// Like `with_store` but with an explicit member identity (no environment access).
     pub fn with_identity(store: impl Store + Send + 'static, member: Option<String>) -> Self {
+        let home = store.home();
         Self {
+            home,
             store: Mutex::new(Box::new(store)),
             member,
             permission_timeout: DEFAULT_PERMISSION_TIMEOUT,
@@ -83,6 +88,9 @@ impl Server {
             return self.permission_request(args);
         }
         let mut store = self.store.lock().expect("store lock poisoned");
+        if let Some(r) = extra::call(&mut **store, self.home.as_deref(), name, &args) {
+            return r;
+        }
         tools::call(&mut **store, name, args)
     }
 

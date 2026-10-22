@@ -13,6 +13,8 @@ pub enum ListAction {
     Select(String),
     TogglePin(String),
     ToggleHide(String),
+    /// Hide (true) or unhide (false) every session in the list.
+    SetHiddenAll(bool),
 }
 
 const ROW_H: f32 = 62.0;
@@ -56,6 +58,17 @@ pub fn show(
         };
         if theme::ghost(ui, &tt(tr, key, default)).clicked() {
             *show_hidden = !*show_hidden;
+        }
+        if !items.is_empty() {
+            let all_hidden = items.iter().all(|s| hidden.contains(&s.id));
+            let (key, d) = if all_hidden {
+                ("common.sessions.actions.unhideAll", "Unhide all")
+            } else {
+                ("common.sessions.actions.hideAll", "Hide all")
+            };
+            if theme::ghost(ui, &tt(tr, key, d)).clicked() {
+                out.push(ListAction::SetHiddenAll(!all_hidden));
+            }
         }
     });
     if items.is_empty() {

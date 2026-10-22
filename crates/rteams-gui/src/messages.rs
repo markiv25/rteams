@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Rect, RichText, Sense, Shape, Stroke, Vec2,
 };
-use rteams_core::{EventKind, Message, Reaction, Scope};
+use rteams_core::{Attachment, EventKind, Message, Reaction, Scope};
 
 use crate::actions::GuiCmd;
 use crate::icons::{self, Icon};
@@ -54,8 +54,47 @@ fn cursor_key(chat: Option<&str>) -> String {
     match chat {
         None => "group".to_string(),
         Some(INBOX) => "inbox".to_string(),
+        Some(g) if g.starts_with(GROUP_PFX) => format!("grp:{}", &g[GROUP_PFX.len()..]),
         Some(m) => format!("dm:{m}"),
     }
+}
+
+/// Prefix of the pseudo chat name that stands for a user-created group chat in `Chat`.
+const GROUP_PFX: &str = "\u{2}group:";
+
+/// The `Chat` value of group chat `id`.
+pub fn group_key(id: &str) -> Chat {
+    Some(format!("{GROUP_PFX}{id}"))
+}
+
+/// The group chat id behind a `Chat` value, if it is one.
+pub fn group_id(chat: Option<&str>) -> Option<&str> {
+    chat?.strip_prefix(GROUP_PFX)
+}
+
+/// Id for a new group chat named `name`: a slug, made unique among `existing`.
+pub fn new_group_id(name: &str, existing: &[String]) -> String {
+    let mut slug: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    slug = slug
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        slug = "group".into();
+    }
+    let mut id = slug.clone();
+    let mut n = 2;
+    while existing.contains(&id) {
+        id = format!("{slug}-{n}");
+        n += 1;
+    }
+    id
 }
 
 /// Pseudo chat name under which the My-inbox read cursor is kept in `seen`.
@@ -76,6 +115,8 @@ fn load_cursor_file(path: &std::path::Path) -> HashMap<Chat, u64> {
                 out.insert(None, n);
             } else if k == "inbox" {
                 out.insert(Some(INBOX.to_string()), n);
+            } else if let Some(g) = k.strip_prefix("grp:") {
+                out.insert(group_key(g), n);
             } else if let Some(m) = k.strip_prefix("dm:") {
                 out.insert(Some(m.to_string()), n);
             }
@@ -106,6 +147,7 @@ fn save_cursor_file(path: &std::path::Path, seen: &HashMap<Chat, u64>) {
 pub fn in_chat(m: &Message, chat: Option<&str>) -> bool {
     match (&m.scope, chat) {
         (Scope::Broadcast, None) => true,
+        (Scope::Group { chat: c }, Some(sel)) => group_id(Some(sel)) == Some(c.as_str()),
         // A cross-team sender is not a member here: match on the recipient only, and show it in
         // the group chat too so the human never misses it.
         (Scope::Direct { .. }, None) => m.from_team.is_some(),
@@ -561,6 +603,57 @@ pub struct Messages {
     quote: Option<(String, String)>,
     focus_composer: bool,
     open_logs: bool,
+    composer: crate::ui::composer::Composer,
+    /// Open "New / Edit group chat" dialog.
+    group_draft: Option<GroupDraft>,
+    /// Group chat id awaiting delete confirmation.
+    group_delete: Option<String>,
+}
+
+/// State of the group chat dialog (`id: None` = creating).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupDraft {
+    pub id: Option<String>,
+    pub name: String,
+    pub members: std::collections::BTreeSet<String>,
+}
+
+impl GroupDraft {
+    /// Why the draft cannot be saved yet.
+    pub fn problem(&self) -> Option<&'static str> {
+        if self.name.trim().is_empty() {
+            Some("rteams.group.namePlaceholder")
+        } else if self.members.is_empty() {
+            Some("rteams.group.noMembers")
+        } else {
+            None
+        }
+    }
+
+    /// The command that saves the draft; `existing` = ids already taken.
+    pub fn command(&self, existing: &[String]) -> Option<GuiCmd> {
+        self.problem().is_none().then(|| {
+            let members: Vec<String> = self.members.iter().cloned().collect();
+            match &self.id {
+                Some(id) => GuiCmd::GroupChatUpdate {
+                    id: id.clone(),
+                    name: Some(self.name.trim().to_string()),
+                    members: Some(members),
+                },
+                None => GuiCmd::GroupChatCreate {
+                    id: new_group_id(&self.name, existing),
+                    name: self.name.trim().to_string(),
+                    members,
+                },
+            }
+        })
+    }
+}
+
+fn group_name(v: &View, id: &str) -> String {
+    v.team()
+        .and_then(|t| t.group_chats.iter().find(|g| g.id == id))
+        .map_or_else(|| id.to_string(), |g| g.name.clone())
 }
 
 fn max_seq(msgs: &[Message], chat: Option<&str>) -> u64 {
@@ -575,9 +668,17 @@ fn max_seq(msgs: &[Message], chat: Option<&str>) -> u64 {
 #[derive(Default)]
 struct BubbleAct {
     reply: Option<(String, String)>,
+    /// `(home, team dir)` for resolving attachment paths.
+    home: Option<(std::path::PathBuf, String)>,
 }
 
 impl Messages {
+    #[cfg(test)]
+    pub fn open_inbox_for_tests(&mut self) {
+        self.open_inbox();
+        self.full = true;
+    }
+
     #[cfg(test)]
     pub fn toggle_full_screen_for_tests(&mut self) {
         self.full = !self.full;
@@ -612,6 +713,7 @@ impl Messages {
 
     /// Where the teams live and which one is open; enables the cross-team recipients.
     pub fn set_home(&mut self, home: std::path::PathBuf, team: String) {
+        self.composer.attach_dir = Some(home.join(&team).join("attachments"));
         self.home = Some((home, team));
         self.other_scanned = None;
         self.other_teams.clear();
@@ -676,6 +778,13 @@ impl Messages {
             self.mark_read(v, Some(&m.name));
         }
         self.mark_inbox_read(v);
+        for g in v
+            .team()
+            .map(|t| t.group_chats.as_slice())
+            .unwrap_or_default()
+        {
+            self.mark_read(v, group_key(&g.id).as_deref());
+        }
     }
 
     fn unread(&self, v: &View, chat: Option<&str>) -> usize {
@@ -698,6 +807,13 @@ impl Messages {
 
     fn total_unread(&self, v: &View) -> usize {
         let mut n = self.unread(v, None) + self.inbox_unread(v);
+        for g in v
+            .team()
+            .map(|t| t.group_chats.as_slice())
+            .unwrap_or_default()
+        {
+            n += self.unread(v, group_key(&g.id).as_deref());
+        }
         for m in v.agent_members().into_iter().filter(|m| !m.removed) {
             n += self.unread(v, Some(&m.name));
         }
@@ -708,6 +824,9 @@ impl Messages {
         if self.inbox {
             return "My inbox".to_string();
         }
+        if let Some(id) = group_id(self.selected.as_deref()) {
+            return group_name(v, id);
+        }
         self.selected
             .clone()
             .unwrap_or_else(|| v.tr.t("team.messages.chats.teamFeed"))
@@ -716,6 +835,7 @@ impl Messages {
     // ---- sidebar ----
 
     pub fn sidebar(&mut self, ui: &mut egui::Ui, v: &View, out: &mut Intents) {
+        self.group_dialogs(ui.ctx(), v, out);
         ui.horizontal(|ui| {
             ui.set_min_height(30.0);
             ui.label(
@@ -818,7 +938,14 @@ impl Messages {
         if v.actor.is_some() {
             rows.push(RowKind::Inbox);
         }
-        rows.extend(members.iter().map(|m| RowKind::Chat(Some(m.name.clone()))));
+        let groups: Vec<String> = v
+            .team()
+            .map(|t| t.group_chats.iter().map(|g| g.id.clone()).collect())
+            .unwrap_or_default();
+        let member_rows: Vec<RowKind> = members
+            .iter()
+            .map(|m| RowKind::Chat(Some(m.name.clone())))
+            .collect();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -826,7 +953,165 @@ impl Messages {
                 for r in rows {
                     self.row(ui, v, out, r);
                 }
+                self.group_header(ui, v);
+                for id in &groups {
+                    self.row(ui, v, out, RowKind::Chat(group_key(id)));
+                }
+                if !groups.is_empty() {
+                    ui.add_space(4.0);
+                }
+                for r in member_rows {
+                    self.row(ui, v, out, r);
+                }
             });
+    }
+
+    /// "Group chats" section header with the new-chat button.
+    fn group_header(&mut self, ui: &mut egui::Ui, v: &View) {
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(v.tr.t("rteams.group.section"))
+                    .size(11.5)
+                    .color(theme::MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if v.actor.is_some()
+                    && theme::icon_button(ui, Icon::Plus, &v.tr.t("rteams.group.new")).clicked()
+                {
+                    self.group_draft = Some(GroupDraft::default());
+                }
+            });
+        });
+    }
+
+    fn edit_group(&mut self, v: &View, id: &str) {
+        if let Some(g) = v
+            .team()
+            .and_then(|t| t.group_chats.iter().find(|g| g.id == id))
+        {
+            self.group_draft = Some(GroupDraft {
+                id: Some(g.id.clone()),
+                name: g.name.clone(),
+                members: g.members.iter().cloned().collect(),
+            });
+        }
+    }
+
+    /// The new/edit dialog and the delete confirmation.
+    fn group_dialogs(&mut self, ctx: &egui::Context, v: &View, out: &mut Intents) {
+        if let Some(mut d) = self.group_draft.take() {
+            let mut open = true;
+            let mut save = false;
+            let mut cancel = false;
+            let title = v.tr.t(if d.id.is_some() {
+                "rteams.group.edit"
+            } else {
+                "rteams.group.new"
+            });
+            let names: Vec<String> = v
+                .agent_members()
+                .iter()
+                .filter(|m| !m.removed)
+                .map(|m| m.name.clone())
+                .collect();
+            theme::dialog(ctx, "group-chat-dialog", &title, 380.0, &mut open, |ui| {
+                ui.label(RichText::new(v.tr.t("rteams.group.name")).color(theme::TEXT_2));
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.name)
+                        .hint_text(v.tr.t("rteams.group.namePlaceholder"))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new(v.tr.t("rteams.group.members")).color(theme::TEXT_2));
+                for n in &names {
+                    let mut on = d.members.contains(n);
+                    if ui.checkbox(&mut on, n).changed() {
+                        if on {
+                            d.members.insert(n.clone());
+                        } else {
+                            d.members.remove(n);
+                        }
+                    }
+                }
+                ui.add_space(8.0);
+                let problem = d.problem();
+                if d.id.is_none() && !d.name.trim().is_empty() {
+                    if let Some(p) = problem {
+                        ui.label(RichText::new(v.tr.t(p)).size(12.0).color(theme::MUTED));
+                    }
+                }
+                ui.horizontal(|ui| {
+                    let label = v.tr.t(if d.id.is_some() {
+                        "rteams.group.save"
+                    } else {
+                        "rteams.group.create"
+                    });
+                    ui.add_enabled_ui(problem.is_none(), |ui| {
+                        if theme::solid(ui, &label, theme::ACCENT).clicked() {
+                            save = true;
+                        }
+                    });
+                    if theme::ghost(ui, &v.tr.t("common.actions.cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            open &= !cancel;
+            if save {
+                let existing: Vec<String> = v
+                    .team()
+                    .map(|t| t.group_chats.iter().map(|g| g.id.clone()).collect())
+                    .unwrap_or_default();
+                if let Some(cmd) = d.command(&existing) {
+                    if let GuiCmd::GroupChatCreate { id, .. } = &cmd {
+                        self.open_chat(group_key(id));
+                        self.full = true;
+                    }
+                    out.push(Intent::Run(cmd));
+                }
+            } else if open {
+                self.group_draft = Some(d);
+            }
+        }
+        if let Some(id) = self.group_delete.clone() {
+            let mut open = true;
+            let mut yes = false;
+            let mut cancel = false;
+            theme::dialog(
+                ctx,
+                "group-chat-delete",
+                &v.tr.t("rteams.group.delete"),
+                340.0,
+                &mut open,
+                |ui| {
+                    ui.label(group_name(v, &id));
+                    ui.label(
+                        RichText::new(v.tr.t("rteams.group.confirmDelete")).color(theme::TEXT_2),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if theme::solid(ui, &v.tr.t("rteams.group.delete"), theme::ERROR).clicked()
+                        {
+                            yes = true;
+                        }
+                        if theme::ghost(ui, &v.tr.t("common.actions.cancel")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
+            open &= !cancel;
+            if yes {
+                if group_id(self.selected.as_deref()) == Some(id.as_str()) {
+                    self.open_chat(None);
+                }
+                out.push(Intent::Run(GuiCmd::GroupChatDelete { id }));
+                self.group_delete = None;
+            } else if !open {
+                self.group_delete = None;
+            }
+        }
     }
 
     fn row(&mut self, ui: &mut egui::Ui, v: &View, out: &mut Intents, kind: RowKind) {
@@ -876,8 +1161,12 @@ impl Messages {
                     )
                 });
                 (
-                    c.clone()
-                        .unwrap_or_else(|| v.tr.t("team.messages.chats.teamFeed")),
+                    match group_id(c.as_deref()) {
+                        Some(id) => group_name(v, id),
+                        None => c
+                            .clone()
+                            .unwrap_or_else(|| v.tr.t("team.messages.chats.teamFeed")),
+                    },
                     last,
                     self.unread(v, c.as_deref()),
                 )
@@ -908,6 +1197,17 @@ impl Messages {
                     Rect::from_center_size(c, Vec2::splat(20.0)),
                     Icon::Users,
                     theme::TEXT_2,
+                );
+            }
+            RowKind::Chat(Some(g)) if group_id(Some(g)).is_some() => {
+                let c = av.center();
+                ui.painter()
+                    .circle_filled(c, 22.0, theme::tint(theme::ACCENT, 0.16));
+                icons::draw(
+                    ui.painter(),
+                    Rect::from_center_size(c, Vec2::splat(20.0)),
+                    Icon::Users,
+                    theme::ACCENT,
                 );
             }
             RowKind::Chat(Some(m)) => {
@@ -998,16 +1298,40 @@ impl Messages {
             painter.galley(br.center() - g.size() / 2.0, g, Color32::PLACEHOLDER);
         }
 
+        if let Some(gid) = group_id(match &kind {
+            RowKind::Chat(c) => c.as_deref(),
+            RowKind::Inbox => None,
+        })
+        .map(str::to_string)
+        {
+            resp.context_menu(|ui| {
+                if theme::menu_item(ui, Some(Icon::Edit), &v.tr.t("rteams.group.edit")).clicked() {
+                    self.edit_group(v, &gid);
+                    ui.close();
+                }
+                if theme::menu_item(ui, Some(Icon::Trash), &v.tr.t("rteams.group.delete")).clicked()
+                {
+                    self.group_delete = Some(gid.clone());
+                    ui.close();
+                }
+            });
+        }
         if resp.clicked() {
             match kind {
                 RowKind::Inbox => {
                     self.open_inbox();
                     self.mark_inbox_read(v);
+                    // Like chat rows: show the conversation pane (it only draws in full-screen chat).
+                    self.full = true;
                 }
                 RowKind::Chat(c) => {
                     self.open_chat(c.clone());
                     self.mark_read(v, c.as_deref());
-                    out.push(Intent::OpenChat(c));
+                    if group_id(c.as_deref()).is_some() {
+                        self.full = true;
+                    } else {
+                        out.push(Intent::OpenChat(c));
+                    }
                 }
             }
         }
@@ -1043,6 +1367,21 @@ impl Messages {
                         );
                     } else {
                         match &chat {
+                            Some(g) if group_id(Some(g)).is_some() => {
+                                let (r, _) =
+                                    ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                                ui.painter().circle_filled(
+                                    r.center(),
+                                    14.0,
+                                    theme::tint(theme::ACCENT, 0.16),
+                                );
+                                icons::draw(
+                                    ui.painter(),
+                                    Rect::from_center_size(r.center(), Vec2::splat(16.0)),
+                                    Icon::Users,
+                                    theme::ACCENT,
+                                );
+                            }
                             None => {
                                 let (r, _) =
                                     ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
@@ -1064,6 +1403,49 @@ impl Messages {
                         }
                     }
                     ui.label(RichText::new(self.chat_title(v)).size(16.0).strong());
+                    if let Some(gid) = group_id(chat.as_deref()).map(str::to_string) {
+                        let members = v
+                            .team()
+                            .and_then(|t| t.group_chats.iter().find(|g| g.id == gid))
+                            .map(|g| g.members.clone())
+                            .unwrap_or_default();
+                        ui.label(
+                            RichText::new(v.tr.t_args(
+                                "rteams.group.membersCount",
+                                &[("n", &members.len().to_string())],
+                            ))
+                            .size(12.0)
+                            .color(theme::MUTED),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let more = theme::icon_button(ui, Icon::MoreHorizontal, "");
+                            egui::Popup::menu(&more).width(200.0).show(|ui| {
+                                if theme::menu_item(
+                                    ui,
+                                    Some(Icon::Edit),
+                                    &v.tr.t("rteams.group.edit"),
+                                )
+                                .clicked()
+                                {
+                                    self.edit_group(v, &gid);
+                                    ui.close();
+                                }
+                                if theme::menu_item(
+                                    ui,
+                                    Some(Icon::Trash),
+                                    &v.tr.t("rteams.group.delete"),
+                                )
+                                .clicked()
+                                {
+                                    self.group_delete = Some(gid.clone());
+                                    ui.close();
+                                }
+                            });
+                            for m in members.iter().rev().take(5) {
+                                theme::avatar(ui, m, v.color(m), 22.0, None);
+                            }
+                        });
+                    }
                 });
             });
         theme::rule(ui);
@@ -1079,7 +1461,10 @@ impl Messages {
         }
 
         let msgs = chat_messages(&v.state.messages, chat.as_deref());
-        let mut act = BubbleAct::default();
+        let mut act = BubbleAct {
+            home: self.home.clone(),
+            ..Default::default()
+        };
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
@@ -1131,10 +1516,17 @@ impl Messages {
                 }
                 for it in &items {
                     let sel = self.inbox_sel == Some(it.seq);
-                    ui.horizontal_top(|ui| {
-                        ui.add_space(12.0);
-                        let w = (ui.available_width() - 12.0).clamp(120.0, 860.0);
+                    // Vertical: inside a horizontal row the card's contents were laid out side
+                    // by side, squeezing the message text into a sliver at the right edge.
+                    ui.vertical(|ui| {
+                        let w = (ui.available_width() - 24.0).clamp(120.0, 860.0);
                         egui::Frame::new()
+                            .outer_margin(egui::Margin {
+                                left: 12,
+                                right: 0,
+                                top: 0,
+                                bottom: 0,
+                            })
                             .fill(theme::RAISED)
                             .stroke(Stroke::new(
                                 1.0,
@@ -1194,7 +1586,7 @@ impl Messages {
                                     }
                                 }
                                 ui.add_space(4.0);
-                                links::rich_text(ui, &it.text, v, out);
+                                readable_text(ui, &it.text, v, out);
                                 ui.add_space(4.0);
                                 if theme::pill_icon_button(ui, None, "Reply", sel).clicked() {
                                     reply = Some(it.clone());
@@ -1348,23 +1740,12 @@ impl Messages {
                 });
                 ui.add_space(4.0);
 
-                let id = ui.make_persistent_id("composer-text");
-                let focused = ui.memory(|m| m.has_focus(id));
-                let mut send = false;
-                if focused {
-                    send = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-                }
-                let r = ui.add(
-                    egui::TextEdit::multiline(&mut self.text)
-                        .id(id)
-                        .hint_text(v.tr.t("team.messageComposer.input.placeholder"))
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .frame(egui::Frame::NONE),
-                );
                 if std::mem::take(&mut self.focus_composer) {
-                    r.request_focus();
+                    self.composer.focus = true;
                 }
+                let ev = self.composer.show(ui, v, &mut self.text);
+                let mut send = ev.send;
+                let mut atts = ev.attachments;
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
@@ -1376,13 +1757,23 @@ impl Messages {
                         self.mode = Mode::ALL[idx];
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let ready = can_write && !self.text.trim().is_empty();
+                        let has_atts = !atts.is_empty() || !self.composer.attachments().is_empty();
+                        let ready = can_write && (!self.text.trim().is_empty() || has_atts);
                         let resp =
                             send_button(ui, &v.tr.t("team.messageComposer.actions.send"), ready);
-                        send |= resp.clicked();
+                        if resp.clicked() {
+                            send = true;
+                            if atts.is_empty() {
+                                atts = self.composer.attachments().to_vec();
+                                let dir = self.composer.attach_dir.take();
+                                self.composer = crate::ui::composer::Composer::default();
+                                self.composer.attach_dir = dir;
+                            }
+                        }
                         if send && ready {
-                            let body = self.text.trim().to_string();
+                            let body = with_attachments(self.text.trim(), &atts);
                             if let (true, Some(task)) = (self.reply_comment, sel_task.clone()) {
+                                let body = with_file_refs(&body, &atts);
                                 out.push(Intent::Run(GuiCmd::Comment { task, text: body }));
                                 self.text.clear();
                                 self.quote = None;
@@ -1398,6 +1789,7 @@ impl Messages {
                                     to.clone(),
                                     &text,
                                     self.mode,
+                                    atts,
                                 ));
                             }
                         }
@@ -1484,19 +1876,66 @@ fn send_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response 
 }
 
 /// The intent for pressing Send: a cross-team delivery, or a plain message in this team.
-fn send_intent(cross: Option<&(String, String)>, to: Chat, text: &str, mode: Mode) -> Intent {
+fn send_intent(
+    cross: Option<&(String, String)>,
+    to: Chat,
+    text: &str,
+    mode: Mode,
+    attachments: Vec<Attachment>,
+) -> Intent {
+    let mode = Some(mode_str(mode).to_string());
     match cross {
         Some((team, member)) => Intent::CrossTeamSend {
             team: team.clone(),
             to: Some(member.clone()),
-            text: text.to_string(),
+            text: with_file_refs(text, &attachments),
         },
-        None => Intent::Run(GuiCmd::Message {
-            to,
-            text: text.to_string(),
-            mode: Some(mode_str(mode).to_string()),
-        }),
+        None => {
+            if let Some(id) = group_id(to.as_deref()) {
+                return Intent::Run(GuiCmd::MessageRich {
+                    to: None,
+                    chat: Some(id.to_string()),
+                    text: text.to_string(),
+                    mode,
+                    attachments,
+                });
+            }
+            if attachments.is_empty() {
+                Intent::Run(GuiCmd::Message {
+                    to,
+                    text: text.to_string(),
+                    mode,
+                })
+            } else {
+                Intent::Run(GuiCmd::MessageRich {
+                    to,
+                    chat: None,
+                    text: text.to_string(),
+                    mode,
+                    attachments,
+                })
+            }
+        }
     }
+}
+
+/// Empty text with attachments becomes a short list of the files; other text is unchanged.
+pub fn with_attachments(text: &str, atts: &[Attachment]) -> String {
+    if text.trim().is_empty() && !atts.is_empty() {
+        let names: Vec<&str> = atts.iter().map(|a| a.name.as_str()).collect();
+        return format!("Attached: {}", names.join(", "));
+    }
+    text.to_string()
+}
+
+/// `text` plus a markdown reference per file, for channels that carry no attachments.
+pub fn with_file_refs(text: &str, atts: &[Attachment]) -> String {
+    let mut out = with_attachments(text, &[]);
+    for a in atts {
+        out.push('\n');
+        out.push_str(&rteams_services::attachments::attachment_markdown(a));
+    }
+    out
 }
 
 const CROSS_TEAM: Color32 = Color32::from_rgb(192, 132, 252);
@@ -1545,6 +1984,7 @@ fn bubble(ui: &mut egui::Ui, v: &View, m: &Message, out: &mut Intents, act: &mut
                         bubble_header(ui, v, m, sender_color);
                         ui.add_space(2.0);
                         bubble_body(ui, v, m, out);
+                        attachments_row(ui, m, act.home.as_ref());
                     });
                 hover_toolbar(ui, v, m, fr.response.rect, fill, mine, out, act);
                 reactions_row(ui, v, m, out);
@@ -1671,6 +2111,13 @@ fn bubble_header(ui: &mut egui::Ui, v: &View, m: &Message, color: Color32) {
             Scope::Broadcast => {
                 ui.label(RichText::new("all").size(12.0).color(theme::TEXT_2));
             }
+            Scope::Group { chat } => {
+                ui.label(
+                    RichText::new(group_name(v, chat))
+                        .size(12.0)
+                        .color(theme::TEXT_2),
+                );
+            }
         }
         if let Some(mode) = m.mode.as_deref() {
             theme::pill(ui, mode, theme::INFO);
@@ -1698,6 +2145,62 @@ fn quote_block(ui: &mut egui::Ui, text: &str) {
         theme::INFO,
     );
     ui.add_space(4.0);
+}
+
+/// Split text into display lines, flagging bullets. Lines starting with `- `, `* `, `• `, `N)` or
+/// `N.` are bullets; a one-paragraph message with an inline `1) .. 2) ..` list is split into a lead
+/// line plus one bullet per item, so agent replies stay readable even when not formatted.
+pub fn to_lines(text: &str) -> Vec<(bool, String)> {
+    let item = regex::Regex::new(r"^\s*(?:[-*•]|\d{1,2}[.)])\s+").unwrap();
+    let inline = regex::Regex::new(r"(?:^|\s)(\d{1,2})\)\s").unwrap();
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(m) = item.find(line) {
+            out.push((true, line[m.end()..].trim().to_string()));
+            continue;
+        }
+        // Inline enumeration: "Lead. 1) first. 2) second." -> lead + bullets.
+        let starts: Vec<(usize, usize)> = inline
+            .find_iter(line)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        if starts.len() >= 2 {
+            let lead = line[..starts[0].0].trim();
+            if !lead.is_empty() {
+                out.push((false, lead.to_string()));
+            }
+            for (i, &(_, body_start)) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).map_or(line.len(), |n| n.0);
+                let body = line[body_start..end].trim();
+                if !body.is_empty() {
+                    out.push((true, body.to_string()));
+                }
+            }
+        } else {
+            out.push((false, line.to_string()));
+        }
+    }
+    out
+}
+
+/// Draw text as readable lines: bullets get a dot and a hanging indent so wrapped lines align.
+fn readable_text(ui: &mut egui::Ui, text: &str, v: &View, out: &mut Intents) {
+    for (bullet, line) in to_lines(text) {
+        if bullet {
+            ui.horizontal_top(|ui| {
+                ui.add_space(4.0);
+                ui.label(RichText::new("•").color(theme::ACCENT));
+                ui.vertical(|ui| links::rich_text(ui, &line, v, out));
+            });
+        } else {
+            links::rich_text(ui, &line, v, out);
+        }
+        ui.add_space(2.0);
+    }
 }
 
 fn bubble_body(ui: &mut egui::Ui, v: &View, m: &Message, out: &mut Intents) {
@@ -1732,10 +2235,88 @@ fn bubble_body(ui: &mut egui::Ui, v: &View, m: &Message, out: &mut Intents) {
             };
             links::rich_text_with(ui, summary, v, out, bold);
             ui.add_space(2.0);
-            links::rich_text(ui, rest, v, out);
+            readable_text(ui, rest, v, out);
         }
-        None => links::rich_text(ui, text, v, out),
+        None => readable_text(ui, text, v, out),
     }
+}
+
+/// Open `path` with the system handler.
+fn open_external(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let cmd = "xdg-open";
+    let _ = std::process::Command::new(cmd).arg(path).spawn();
+}
+
+/// Decoded thumbnail of an image attachment, cached per path (`None` = undecodable).
+fn thumb(ctx: &egui::Context, path: &std::path::Path) -> Option<egui::TextureHandle> {
+    let id = egui::Id::NULL.with(("att-thumb", path));
+    if let Some(t) = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
+        return t;
+    }
+    let tex = rteams_services::attachments::thumbnail(path, 640).map(|(w, h, rgba)| {
+        let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+        ctx.load_texture(path.to_string_lossy(), img, egui::TextureOptions::LINEAR)
+    });
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    tex
+}
+
+/// Images as inline previews, other files as chips; clicking opens the file.
+fn attachments_row(ui: &mut egui::Ui, m: &Message, home: Option<&(std::path::PathBuf, String)>) {
+    if m.attachments.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+        for a in &m.attachments {
+            let path = match home {
+                Some((h, t)) => rteams_services::attachments::resolve(h, t, a),
+                None => std::path::PathBuf::from(&a.path),
+            };
+            let tex = rteams_services::attachments::is_image(a)
+                .then(|| thumb(ui.ctx(), &path))
+                .flatten();
+            let resp = match tex {
+                Some(t) => ui.add(
+                    egui::Image::new(&t)
+                        .max_size(Vec2::new(260.0, 180.0))
+                        .corner_radius(CornerRadius::same(8))
+                        .sense(Sense::click()),
+                ),
+                None => {
+                    let r = egui::Frame::new()
+                        .fill(theme::tint(theme::INFO, 0.08))
+                        .stroke(Stroke::new(1.0, theme::hairline(0.1)))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                icons::icon(ui, Icon::Paperclip, 13.0, theme::TEXT_2);
+                                ui.label(RichText::new(&a.name).size(12.5));
+                            });
+                        });
+                    ui.interact(
+                        r.response.rect,
+                        ui.scope_id().with(("att", &a.path)),
+                        Sense::click(),
+                    )
+                }
+            };
+            if resp
+                .on_hover_text(path.display().to_string())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                open_external(&path);
+            }
+        }
+    });
 }
 
 fn reactions_row(ui: &mut egui::Ui, v: &View, m: &Message, out: &mut Intents) {
@@ -1776,6 +2357,30 @@ fn reactions_row(ui: &mut egui::Ui, v: &View, m: &Message, out: &mut Intents) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_lists_and_dash_lines_become_bullets() {
+        let l = to_lines(
+            "Fixed 1-6. 1) Step token checked. 2) Points never auto-verify. 3) Intro card.",
+        );
+        assert_eq!(l[0], (false, "Fixed 1-6.".to_string()));
+        assert_eq!(l.len(), 4);
+        assert!(l[1..].iter().all(|(b, _)| *b));
+        assert_eq!(l[2].1, "Points never auto-verify.");
+        let l = to_lines("- one\n- two\nplain");
+        assert_eq!(
+            l,
+            vec![
+                (true, "one".into()),
+                (true, "two".into()),
+                (false, "plain".into())
+            ]
+        );
+        assert_eq!(
+            to_lines("see 1) only one item"),
+            vec![(false, "see 1) only one item".into())]
+        );
+    }
     use crate::view::testing::{fixture, render};
 
     fn msg(seq: u64, from: &str, scope: Scope) -> Message {
@@ -1788,6 +2393,7 @@ mod tests {
             mode: None,
             from_team: None,
             reactions: Vec::new(),
+            attachments: vec![],
         }
     }
 
@@ -1944,7 +2550,7 @@ mod tests {
     fn send_picks_cross_team_or_local() {
         let cross = ("other".to_string(), "zed".to_string());
         assert_eq!(
-            send_intent(Some(&cross), None, "hi", Mode::Do),
+            send_intent(Some(&cross), None, "hi", Mode::Do, vec![]),
             Intent::CrossTeamSend {
                 team: "other".into(),
                 to: Some("zed".into()),
@@ -1952,7 +2558,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            send_intent(None, Some("ada".into()), "hi", Mode::Ask),
+            send_intent(None, Some("ada".into()), "hi", Mode::Ask, vec![]),
             Intent::Run(GuiCmd::Message { .. })
         ));
     }
@@ -2069,6 +2675,7 @@ mod tests {
             mode: None,
             from_team: None,
             reactions: Vec::new(),
+            attachments: vec![],
         };
         msgs.push(mk(900, "ada", Scope::Direct { to: "boss".into() }, "dm"));
         msgs.push(mk(901, "ada", Scope::Direct { to: "bob".into() }, "not me"));
@@ -2116,5 +2723,127 @@ mod tests {
         n.load_cursors(path.clone());
         assert_eq!(n.seen.get(&Some(INBOX.to_string())), Some(&7));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn group_ids_keys_and_scoping() {
+        assert_eq!(new_group_id("Backend Sync!", &[]), "backend-sync");
+        assert_eq!(new_group_id("  ", &[]), "group");
+        assert_eq!(
+            new_group_id("a", &["a".to_string(), "a-2".to_string()]),
+            "a-3"
+        );
+        let k = group_key("g1");
+        assert_eq!(group_id(k.as_deref()), Some("g1"));
+        assert_eq!(group_id(Some("ada")), None);
+        assert_eq!(cursor_key(k.as_deref()), "grp:g1");
+        let g = msg(1, "ada", Scope::Group { chat: "g1".into() });
+        assert!(in_chat(&g, k.as_deref()));
+        assert!(!in_chat(&g, group_key("g2").as_deref()));
+        assert!(!in_chat(&g, None));
+        assert!(!in_chat(&g, Some("ada")));
+        let p = std::env::temp_dir().join(format!("rteams-grp-{}.json", std::process::id()));
+        let mut seen = HashMap::new();
+        seen.insert(k.clone(), 5);
+        save_cursor_file(&p, &seen);
+        assert_eq!(load_cursor_file(&p).get(&k), Some(&5));
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn group_draft_validates_and_builds_commands() {
+        let mut d = GroupDraft::default();
+        assert!(d.command(&[]).is_none());
+        d.name = "Core crew".into();
+        assert!(d.command(&[]).is_none());
+        d.members.insert("ada".into());
+        match d.command(&[]).unwrap() {
+            GuiCmd::GroupChatCreate { id, name, members } => {
+                assert_eq!((id.as_str(), name.as_str()), ("core-crew", "Core crew"));
+                assert_eq!(members, vec!["ada".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        d.id = Some("g1".into());
+        assert!(matches!(
+            d.command(&[]).unwrap(),
+            GuiCmd::GroupChatUpdate { .. }
+        ));
+    }
+
+    #[test]
+    fn send_intent_routes_groups_and_attachments() {
+        let att = vec![Attachment {
+            name: "a.png".into(),
+            path: "/x/a.png".into(),
+        }];
+        let Intent::Run(GuiCmd::MessageRich { chat, to, .. }) =
+            send_intent(None, group_key("g1"), "hi", Mode::Do, vec![])
+        else {
+            panic!()
+        };
+        assert_eq!((chat.as_deref(), to), (Some("g1"), None));
+        assert!(matches!(
+            send_intent(None, Some("ada".into()), "hi", Mode::Do, vec![]),
+            Intent::Run(GuiCmd::Message { .. })
+        ));
+        assert!(matches!(
+            send_intent(None, Some("ada".into()), "hi", Mode::Do, att.clone()),
+            Intent::Run(GuiCmd::MessageRich { .. })
+        ));
+        assert_eq!(with_attachments("", &att), "Attached: a.png");
+        assert_eq!(with_attachments("t", &att), "t");
+        assert!(with_file_refs("t", &att).contains("![a.png](/x/a.png)"));
+    }
+
+    #[test]
+    fn renders_group_chat_with_attachments() {
+        use crate::actions::Commander;
+        let (home, mut data) = fixture("messages-group");
+        let mut c = Commander::new(home.clone(), "t".into());
+        c.run(
+            "boss",
+            &GuiCmd::GroupChatCreate {
+                id: "g1".into(),
+                name: "Crew".into(),
+                members: vec!["ada".into()],
+            },
+        )
+        .unwrap();
+        data.refresh().unwrap();
+        let mut st = data.state().clone();
+        let mut gm = msg(900, "ada", Scope::Group { chat: "g1".into() });
+        gm.text = "hello group".into();
+        gm.attachments = vec![
+            Attachment {
+                name: "notes.txt".into(),
+                path: "/nonexistent/notes.txt".into(),
+            },
+            Attachment {
+                name: "pic.png".into(),
+                path: "/nonexistent/pic.png".into(),
+            },
+        ];
+        st.messages.push(gm);
+        let v = View {
+            state: &st,
+            data: &data,
+            actor: Some("boss"),
+            agents: &[],
+            tr: crate::view::testing::tr(),
+        };
+        let mut m = Messages::default();
+        m.set_home(home.clone(), "t".into());
+        let mut out = Intents::default();
+        render(|ui| m.sidebar(ui, &v, &mut out));
+        assert_eq!(m.unread(&v, group_key("g1").as_deref()), 1);
+        m.open_chat(group_key("g1"));
+        assert_eq!(m.chat_title(&v), "Crew");
+        render(|ui| m.chat(ui, &v, &mut out));
+        assert_eq!(m.unread(&v, group_key("g1").as_deref()), 0);
+        m.group_draft = Some(GroupDraft::default());
+        m.group_delete = Some("g1".into());
+        render(|ui| m.sidebar(ui, &v, &mut out));
+        let _ = std::fs::remove_dir_all(home);
     }
 }

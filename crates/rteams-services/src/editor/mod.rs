@@ -3,6 +3,7 @@
 
 pub mod conflict;
 pub mod files;
+pub mod gitops;
 pub mod gitstatus;
 pub mod search;
 pub mod sessions;

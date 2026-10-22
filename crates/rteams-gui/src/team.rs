@@ -228,6 +228,32 @@ pub fn header(
             {
                 out.push(Intent::OpenApprovals);
             }
+            if running {
+                let (ready, stuck, total) = launch_summary(ui, v);
+                if stuck > 0 {
+                    pill20(
+                        ui,
+                        None,
+                        &format!("{stuck} {}", v.tr.t("rteams.diag.stuck")),
+                        theme::WARNING,
+                    )
+                    .on_hover_text(v.tr.t_args(
+                        "rteams.diag.stuckTip",
+                        &[("secs", &(STUCK_AFTER_MS / 1000).to_string())],
+                    ));
+                } else if total > 0 {
+                    pill20(
+                        ui,
+                        None,
+                        &format!("{ready}/{total} {}", v.tr.t("rteams.diag.ready")),
+                        if ready == total {
+                            theme::SUCCESS
+                        } else {
+                            theme::MUTED
+                        },
+                    );
+                }
+            }
             if running
                 && pill20(
                     ui,
@@ -275,6 +301,230 @@ pub fn header(
         ui.add_space(8.0);
     }
     settings_clicked
+}
+
+/// No heartbeat this long after launch means the agent is probably stuck.
+pub const STUCK_AFTER_MS: i64 = 90_000;
+
+/// Launch diagnosis of one running agent, from its heartbeat and how long ago it launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Diag {
+    Starting,
+    Ready,
+    Working,
+    Idle,
+    Stuck,
+}
+
+impl Diag {
+    pub fn key(self) -> &'static str {
+        match self {
+            Diag::Starting => "rteams.diag.starting",
+            Diag::Ready => "rteams.diag.ready",
+            Diag::Working => "rteams.diag.working",
+            Diag::Idle => "rteams.diag.idle",
+            Diag::Stuck => "rteams.diag.stuck",
+        }
+    }
+
+    pub fn color(self) -> Color32 {
+        match self {
+            Diag::Starting => theme::MUTED,
+            Diag::Ready | Diag::Working => theme::SUCCESS,
+            Diag::Idle => theme::TEXT_2,
+            Diag::Stuck => theme::WARNING,
+        }
+    }
+}
+
+/// `hb` = the member's last heartbeat `(status, ts_ms)`. A heartbeat from before this launch
+/// does not count; with none, the agent is `Starting` until `STUCK_AFTER_MS` have passed.
+pub fn diagnose(launched_ms: i64, hb: Option<(&str, i64)>, now_ms: i64) -> Diag {
+    if let Some((status, ts)) = hb {
+        if ts >= launched_ms {
+            match status {
+                "stuck" => return Diag::Stuck,
+                "ready" => return Diag::Ready,
+                "working" => return Diag::Working,
+                "idle" => return Diag::Idle,
+                _ => {}
+            }
+        }
+    }
+    if now_ms - launched_ms > STUCK_AFTER_MS {
+        Diag::Stuck
+    } else {
+        Diag::Starting
+    }
+}
+
+/// Diagnosis for a running member, with a tooltip; `None` when it is not running.
+pub fn member_diag(ui: &egui::Ui, v: &View, name: &str) -> Option<(Diag, String)> {
+    let a = v.agent(name)?;
+    let AgentStatus::Running { pid } = a.status else {
+        return None;
+    };
+    let now = now_ms();
+    let id = egui::Id::unique(("launch-seen", name));
+    let (seen_pid, seen_at): (u32, i64) = ui
+        .data_mut(|d| d.get_temp(id))
+        .filter(|(p, _)| *p == pid)
+        .unwrap_or((pid, now));
+    ui.data_mut(|d| d.insert_temp(id, (seen_pid, seen_at)));
+    let hb = v.state.heartbeats.get(name);
+    let d = diagnose(seen_at, hb.map(|h| (h.status.as_str(), h.ts)), now);
+    let mut tip = match d {
+        Diag::Stuck if hb.is_none_or(|h| (h.ts) < seen_at) => v.tr.t_args(
+            "rteams.diag.stuckTip",
+            &[("secs", &(STUCK_AFTER_MS / 1000).to_string())],
+        ),
+        _ => v.tr.t(d.key()),
+    };
+    if let Some(h) = hb.filter(|h| h.ts >= seen_at) {
+        for extra in [h.task.as_deref(), h.note.as_deref()].into_iter().flatten() {
+            tip.push('\n');
+            tip.push_str(extra);
+        }
+    }
+    Some((d, tip))
+}
+
+/// Whether the project can host per-member git worktrees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitReadiness {
+    NotRepo,
+    NoCommit,
+    /// A repo with commits, but uncommitted changes (worktrees branch from HEAD without them).
+    Dirty(Option<String>),
+    /// HEAD is not on a branch.
+    Detached,
+    Ready(Option<String>),
+}
+
+fn git_ok(path: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Checks `path` with the `git` binary: a repo, with a HEAD commit on a branch, and a clean tree.
+pub fn git_readiness(path: &std::path::Path) -> GitReadiness {
+    use crate::diagnostics::Readiness;
+    match crate::diagnostics::readiness(path) {
+        Readiness::NotRepo => GitReadiness::NotRepo,
+        Readiness::NoCommit => GitReadiness::NoCommit,
+        Readiness::Detached => GitReadiness::Detached,
+        Readiness::Ready(b) => match git_ok(path, &["status", "--porcelain"]) {
+            Some(s) if !s.trim().is_empty() => GitReadiness::Dirty(Some(b)),
+            _ => GitReadiness::Ready(Some(b)),
+        },
+    }
+}
+
+/// `git_readiness` cached for a few seconds so the frame loop does not shell out.
+fn cached_git(ui: &egui::Ui, path: &str, force: bool) -> GitReadiness {
+    use std::time::{Duration, Instant};
+    let id = egui::Id::unique("git-readiness");
+    let cached: Option<(String, Instant, GitReadiness)> = ui.data_mut(|d| d.get_temp(id));
+    if let Some((p, at, r)) = cached {
+        if !force && p == path && at.elapsed() < Duration::from_secs(5) {
+            return r;
+        }
+    }
+    let r = git_readiness(std::path::Path::new(path));
+    ui.data_mut(|d| d.insert_temp(id, (path.to_string(), Instant::now(), r.clone())));
+    r
+}
+
+/// Worktree git-readiness banner: shown when a member works in its own worktree. Offers the
+/// one-click fixes (init repo / initial commit) like the original.
+fn git_banner(ui: &mut egui::Ui, v: &View) {
+    let Some(project) = v
+        .team()
+        .and_then(|t| t.project_path.as_deref())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
+        return;
+    };
+    if !v.members().iter().any(|m| m.worktree && !m.removed) {
+        return;
+    }
+    let tr = v.tr;
+    let state = cached_git(ui, project, false);
+    let (text, color, fix): (String, Color32, Option<(&str, bool)>) = match &state {
+        GitReadiness::Ready(b) => (
+            match b {
+                Some(b) => tr.t_args("team.worktreeGitReadiness.readyOnBranch", &[("branch", b)]),
+                None => tr.t("team.worktreeGitReadiness.ready"),
+            },
+            theme::SUCCESS,
+            None,
+        ),
+        GitReadiness::Dirty(_) => (tr.t("rteams.diag.gitDirty"), theme::WARNING, None),
+        GitReadiness::Detached => (tr.t("rteams.diag.gitDetached"), theme::WARNING, None),
+        GitReadiness::NoCommit => (
+            tr.t("rteams.diag.gitNoCommit"),
+            theme::WARNING,
+            Some(("team.worktreeGitReadiness.createInitialCommit", false)),
+        ),
+        GitReadiness::NotRepo => (
+            tr.t("rteams.diag.gitNotRepo"),
+            theme::WARNING,
+            Some(("team.worktreeGitReadiness.initializeRepository", true)),
+        ),
+    };
+    let mut fixed = false;
+    ui.horizontal_wrapped(|ui| {
+        icons::icon(ui, Icon::GitBranch, 14.0, color);
+        ui.label(RichText::new(text).size(12.0).color(color));
+        if let Some((key, init)) = fix {
+            if theme::ghost(ui, &tr.t(key)).clicked() {
+                let p = std::path::Path::new(project);
+                let _ = if init {
+                    crate::diagnostics::init_repo(p)
+                        .and_then(|()| crate::diagnostics::initial_commit(p))
+                } else {
+                    crate::diagnostics::initial_commit(p)
+                };
+                fixed = true;
+            }
+        }
+    });
+    if fixed {
+        cached_git(ui, project, true);
+    }
+    if !matches!(state, GitReadiness::Ready(_) | GitReadiness::Dirty(_)) {
+        ui.label(
+            RichText::new(tr.t("rteams.launchDiag.blocked"))
+                .size(11.0)
+                .color(theme::MUTED),
+        );
+    }
+    ui.add_space(4.0);
+}
+
+/// `(ready, stuck, running)` over the running agents.
+fn launch_summary(ui: &egui::Ui, v: &View) -> (usize, usize, usize) {
+    let mut r = (0, 0, 0);
+    for m in v.agent_members() {
+        if let Some((d, _)) = member_diag(ui, v, &m.name) {
+            r.2 += 1;
+            match d {
+                Diag::Ready | Diag::Working | Diag::Idle => r.0 += 1,
+                Diag::Stuck => r.1 += 1,
+                Diag::Starting => {}
+            }
+        }
+    }
+    r
 }
 
 /// Compact outlined pill (20px tall, 10.5px text) with an optional leading icon.
@@ -384,10 +634,13 @@ pub fn members(ui: &mut egui::Ui, v: &View, out: &mut Intents) {
                 );
                 return;
             }
+            git_banner(ui, v);
+            diag_cards(ui, v, out);
             for m in &members {
                 member_row(ui, v, &m.name, &m.role, out);
                 theme::rule(ui);
             }
+            crate::forms::members_json_editor(ui, v, out);
         },
     );
     if !removed.is_empty() {
@@ -433,7 +686,7 @@ pub fn process_row_text(p: &rteams_core::ProcessEntry) -> (&'static str, String,
 }
 
 /// &v.tr.t("rteams.team.processes") section: registered dev servers etc. Default closed.
-pub fn processes(ui: &mut egui::Ui, v: &View) {
+pub fn processes(ui: &mut egui::Ui, v: &View, out: &mut Intents) {
     let procs = &v.state.processes;
     let live = procs.iter().filter(|p| p.running).count();
     theme::section(
@@ -467,6 +720,16 @@ pub fn processes(ui: &mut egui::Ui, v: &View) {
                     }
                     if let Some(url) = &p.url {
                         ui.hyperlink_to(url, url);
+                    }
+                    if p.running && v.actor.is_some() {
+                        let tip = if v.tr.has("rteams.team.killProcess") {
+                            v.tr.t("rteams.team.killProcess")
+                        } else {
+                            "Kill process".to_string()
+                        };
+                        if theme::icon_button(ui, Icon::Trash, &tip).clicked() {
+                            out.push(Intent::Run(GuiCmd::KillProcess { pid: p.pid }));
+                        }
                     }
                 });
                 if let Some(cmd) = &p.command {
@@ -522,6 +785,138 @@ fn capitalize(s: &str) -> String {
     c.next()
         .map(|f| f.to_uppercase().chain(c).collect())
         .unwrap_or_default()
+}
+
+/// Per-member cards for launches that failed: the cause, the last log lines and a fix.
+fn diag_cards(ui: &mut egui::Ui, v: &View, out: &mut Intents) {
+    let Some(team) = v.team().map(|t| t.name.as_str()) else {
+        return;
+    };
+    for m in v.agent_members() {
+        let running = v
+            .agent(&m.name)
+            .is_some_and(|a| matches!(a.status, AgentStatus::Running { .. }));
+        if running {
+            continue;
+        }
+        let Some(diag) = crate::diagnostics::record(team, &m.name).and_then(|r| r.diag) else {
+            continue;
+        };
+        diag_card(ui, v, &m.name, &diag, out);
+        ui.add_space(6.0);
+    }
+}
+
+/// One failed-launch card.
+pub fn diag_card(
+    ui: &mut egui::Ui,
+    v: &View,
+    member: &str,
+    diag: &crate::diagnostics::LaunchDiag,
+    out: &mut Intents,
+) {
+    use crate::diagnostics::Fix;
+    let tr = v.tr;
+    let color = theme::ERROR;
+    egui::Frame::new()
+        .fill(theme::tint(color, 0.08))
+        .stroke(Stroke::new(1.0, theme::tint(color, 0.4)))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{member} \u{00B7} {}",
+                        tr.t("rteams.launchDiag.title")
+                    ))
+                    .strong()
+                    .color(color),
+                );
+                if let Some(c) = diag.code {
+                    ui.label(
+                        RichText::new(
+                            tr.t_args("rteams.launchDiag.exitCode", &[("code", &c.to_string())]),
+                        )
+                        .size(11.0)
+                        .color(theme::MUTED),
+                    );
+                }
+            });
+            ui.label(RichText::new(tr.t(diag.cause.key())).size(13.0));
+            if let Some(d) = &diag.detail {
+                ui.add(
+                    egui::Label::new(RichText::new(d).size(11.0).monospace().color(theme::MUTED))
+                        .truncate(),
+                );
+            }
+            if !diag.tail.is_empty() {
+                egui::CollapsingHeader::new(
+                    RichText::new(tr.t("rteams.launchDiag.lastLines")).size(11.0),
+                )
+                .id_salt(("launch-diag-tail", member))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .id_salt(("launch-diag-scroll", member))
+                        .show(ui, |ui| {
+                            for l in &diag.tail {
+                                ui.label(RichText::new(l).size(11.0).monospace());
+                            }
+                        });
+                });
+            }
+            ui.horizontal(|ui| {
+                let fix = diag.cause.fix();
+                if theme::ghost(ui, &tr.t(fix.key())).clicked() {
+                    out.push(match fix {
+                        Fix::OpenProviders => Intent::OpenProviders,
+                        Fix::OpenLaunchDialog => Intent::Launch(member.to_string()),
+                        Fix::Retry => Intent::Restart(member.to_string()),
+                    });
+                }
+                if fix != Fix::Retry && theme::ghost(ui, &tr.t(Fix::Retry.key())).clicked() {
+                    out.push(Intent::Restart(member.to_string()));
+                }
+            });
+        });
+}
+
+/// Extra member-list chip for the spawn state: spawning, a non-zero exit, or a diagnosed
+/// failure (running and clean exits are already the status chip). `(text, color, tooltip)`.
+fn spawn_chip(v: &View, member: &str) -> Option<(String, Color32, String)> {
+    use crate::diagnostics::SpawnState;
+    let team = v.team()?.name.as_str();
+    let rec = crate::diagnostics::record(team, member)?;
+    let agent = v.agent(member)?;
+    let running = matches!(agent.status, AgentStatus::Running { .. });
+    let code = match agent.status {
+        AgentStatus::Exited { code } => code,
+        _ => None,
+    };
+    let tr = v.tr;
+    match SpawnState::of(running, &rec, code) {
+        SpawnState::Spawning => Some((
+            tr.t("rteams.launchDiag.state.spawning"),
+            theme::MUTED,
+            String::new(),
+        )),
+        SpawnState::Failed(c) => Some((
+            tr.t("rteams.launchDiag.state.failed"),
+            theme::ERROR,
+            tr.t(c.key()),
+        )),
+        SpawnState::Exited(Some(c)) if c != 0 => Some((
+            tr.t_args(
+                "rteams.launchDiag.state.exitCode",
+                &[("code", &c.to_string())],
+            ),
+            theme::ERROR,
+            String::new(),
+        )),
+        _ => None,
+    }
 }
 
 fn member_row(ui: &mut egui::Ui, v: &View, name: &str, role: &str, out: &mut Intents) {
@@ -670,6 +1065,25 @@ fn member_row(ui: &mut egui::Ui, v: &View, name: &str, role: &str, out: &mut Int
             {
                 chip(ui, &t, theme::WARNING);
             }
+            if !is_human && running {
+                if let Some(u) = v
+                    .team()
+                    .and_then(|t| crate::context_usage::get(&t.name, name))
+                {
+                    crate::context_usage::meter(ui, &u);
+                }
+            }
+            if !is_human {
+                if let Some((text, c, tip)) = spawn_chip(v, name) {
+                    let r = chip(ui, &text, c);
+                    if !tip.is_empty() {
+                        r.on_hover_text(tip);
+                    }
+                }
+                if let Some((d, tip)) = member_diag(ui, v, name) {
+                    chip(ui, &v.tr.t(d.key()), d.color()).on_hover_text(tip);
+                }
+            }
         });
     });
 }
@@ -689,6 +1103,49 @@ mod tests {
             last_error: None,
             runtime: String::new(),
         }
+    }
+
+    #[test]
+    fn diagnose_ready_starting_stuck() {
+        let t0 = 1_000_000;
+        assert_eq!(diagnose(t0, None, t0 + 10_000), Diag::Starting);
+        assert_eq!(diagnose(t0, None, t0 + 91_000), Diag::Stuck);
+        assert_eq!(
+            diagnose(t0, Some(("ready", t0 + 5_000)), t0 + 200_000),
+            Diag::Ready
+        );
+        assert_eq!(
+            diagnose(t0, Some(("working", t0 + 5_000)), t0 + 9_000),
+            Diag::Working
+        );
+        assert_eq!(
+            diagnose(t0, Some(("stuck", t0 + 5_000)), t0 + 9_000),
+            Diag::Stuck
+        );
+        // A heartbeat from a previous run does not count.
+        assert_eq!(
+            diagnose(t0, Some(("ready", t0 - 1)), t0 + 1_000),
+            Diag::Starting
+        );
+        assert_eq!(
+            diagnose(t0, Some(("starting", t0 + 1)), t0 + 95_000),
+            Diag::Stuck
+        );
+    }
+
+    #[test]
+    fn git_readiness_follows_the_repo() {
+        let d = std::env::temp_dir().join(format!("rteams-gitready-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(git_readiness(&d), GitReadiness::NotRepo);
+        crate::git::init_repo(&d).unwrap();
+        assert_eq!(git_readiness(&d), GitReadiness::NoCommit);
+        std::fs::write(d.join("a.txt"), "x").unwrap();
+        crate::git::initial_commit(&d).unwrap();
+        assert!(matches!(git_readiness(&d), GitReadiness::Ready(_)));
+        std::fs::write(d.join("b.txt"), "y").unwrap();
+        assert!(matches!(git_readiness(&d), GitReadiness::Dirty(_)));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -759,7 +1216,7 @@ mod tests {
                 let mut out = Intents::default();
                 let _ = header(ui, &v, &mut wd, 3, &mut out);
                 members(ui, &v, &mut out);
-                processes(ui, &v);
+                processes(ui, &v, &mut out);
             });
         }
         let _ = std::fs::remove_dir_all(home);
@@ -815,6 +1272,8 @@ mod tests {
                 from_team: None,
                 text: "x".into(),
                 mode: None,
+                attachments: vec![],
+                chat: None,
             },
         };
         let evs = [ev(1_000, "ada"), ev(5_000_000, "bob")];
@@ -870,5 +1329,50 @@ mod tests {
             process_row_text(&p),
             ("running", "pid 42".to_string(), Some(":3000".to_string()))
         );
+    }
+
+    #[test]
+    fn diag_card_and_banner_render() {
+        let (home, d) = fixture("diagcard");
+        let v = View {
+            state: d.state(),
+            data: &d,
+            actor: Some("boss"),
+            agents: &[],
+            tr: crate::view::testing::tr(),
+        };
+        let diag = crate::diagnostics::LaunchDiag {
+            cause: crate::diagnostics::Cause::NotSignedIn,
+            code: Some(1),
+            detail: Some("error: Not logged in".into()),
+            tail: (0..20).map(|i| format!("line {i}")).collect(),
+        };
+        let mut out = Intents::default();
+        crate::view::testing::render(|ui| {
+            diag_card(ui, &v, "ada", &diag, &mut out);
+            git_banner(ui, &v);
+        });
+        assert!(out.0.is_empty());
+        let team = d.state().team.as_ref().unwrap().name.clone();
+        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut rec = crate::diagnostics::LaunchRecord::new(0, events);
+        rec.diag = Some(diag);
+        crate::diagnostics::publish(
+            &team,
+            "ada",
+            std::sync::Arc::new(std::sync::Mutex::new(rec)),
+        );
+        let agents = [agent("ada", AgentStatus::Exited { code: Some(1) })];
+        let v = View {
+            agents: &agents,
+            ..v
+        };
+        crate::view::testing::render(|ui| {
+            let mut out = Intents::default();
+            members(ui, &v, &mut out);
+        });
+        let (text, _, tip) = spawn_chip(&v, "ada").unwrap();
+        assert!(!text.is_empty() && !tip.is_empty());
+        let _ = std::fs::remove_dir_all(home);
     }
 }

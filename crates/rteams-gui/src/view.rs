@@ -95,6 +95,8 @@ pub enum Intent {
         task: String,
         path: String,
     },
+    /// Switch to the Providers tab (launch-failure fix).
+    OpenProviders,
     /// `git init` in the team's project path / initial commit there.
     GitInit,
     GitInitialCommit,

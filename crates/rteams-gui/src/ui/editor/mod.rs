@@ -26,6 +26,7 @@ pub mod md_preview;
 pub mod quick_open;
 pub mod search_panel;
 pub mod shortcuts;
+pub mod source_control;
 pub mod status_bar;
 pub mod tabs;
 pub mod tree;
@@ -86,6 +87,7 @@ pub struct EditorScreen {
     files_rx: Option<Receiver<Vec<String>>>,
     quick: quick_open::QuickOpen,
     search: search_panel::SearchPanel,
+    sc: source_control::SourceControl,
     dialog: Dialog,
     show_shortcuts: bool,
     sidebar_open: bool,
@@ -121,6 +123,7 @@ impl EditorScreen {
             files_rx: None,
             quick: Default::default(),
             search: Default::default(),
+            sc: Default::default(),
             dialog: Dialog::None,
             show_shortcuts: false,
             sidebar_open: true,
@@ -615,6 +618,11 @@ impl EditorScreen {
             if let Ok(g) = rx.try_recv() {
                 self.git = g;
                 self.git_rx = None;
+                if self.sc.open {
+                    if let Some(root) = self.root.clone() {
+                        self.sc.refresh(&root, ctx);
+                    }
+                }
             }
         }
         if self.git_rx.is_none() {
@@ -634,6 +642,13 @@ impl EditorScreen {
             }
         }
         self.search.poll();
+        if let Some(root) = self.root.clone() {
+            if self.sc.poll(&root, ctx) {
+                self.git_stale_at = Some(Instant::now());
+                self.files_cache = None;
+                self.refresh_tree();
+            }
+        }
         if self.session_dirty || self.tabs.iter().any(|t| t.dirty) {
             if self.last_flush.elapsed() >= SESSION_FLUSH {
                 self.flush_session();
@@ -956,6 +971,16 @@ impl Screen for EditorScreen {
                         jump = self.search.show(ui, &root, c.tr);
                         return;
                     }
+                    if self.sc.open {
+                        let cur = self.tabs.get(self.active).map(|t| t.rel.clone());
+                        let o = self.sc.show(ui, &root, cur.as_deref());
+                        jump = o.open_file.map(|rel| search_panel::Jump {
+                            rel,
+                            line: 1,
+                            col: 1,
+                        });
+                        return;
+                    }
                     ui.horizontal(|ui| {
                         ui.strong(c.tr.t("team.editor.sidebar.explorer"));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -965,6 +990,15 @@ impl Screen for EditorScreen {
                                 .clicked()
                             {
                                 close_editor = true;
+                            }
+                            if crate::theme::icon_button(
+                                ui,
+                                crate::icons::Icon::GitBranch,
+                                "Source Control",
+                            )
+                            .clicked()
+                            {
+                                self.sc.toggle();
                             }
                             if ui
                                 .small_button("↺")
@@ -1007,6 +1041,7 @@ impl Screen for EditorScreen {
                 self.open_file(&rel, None);
             }
         }
+        self.sc.show_windows(&ctx);
         if self.show_shortcuts {
             shortcuts::show(&ctx, &mut self.show_shortcuts, c.tr);
         }

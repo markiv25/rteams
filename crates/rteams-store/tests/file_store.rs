@@ -64,6 +64,7 @@ fn script() -> Vec<(&'static str, Command)> {
             Command::Comment {
                 task: t("a"),
                 text: "working".into(),
+                attachments: vec![],
             },
         ),
         (
@@ -87,6 +88,8 @@ fn script() -> Vec<(&'static str, Command)> {
                 to: Some("echo".into()),
                 text: "hi".into(),
                 from_team: None,
+                attachments: vec![],
+                chat: None,
             },
         ),
         (
@@ -96,6 +99,8 @@ fn script() -> Vec<(&'static str, Command)> {
                 to: None,
                 text: "all".into(),
                 from_team: None,
+                attachments: vec![],
+                chat: None,
             },
         ),
         (
@@ -189,6 +194,7 @@ fn rejected_command_appends_nothing() {
             Command::Comment {
                 task: "nope".into(),
                 text: "x".into(),
+                attachments: vec![],
             },
         )
         .unwrap_err();
@@ -221,6 +227,8 @@ fn second_handle_sees_writes_from_first() {
                 to: None,
                 text: "from b".into(),
                 from_team: None,
+                attachments: vec![],
+                chat: None,
             },
         )
         .unwrap();
@@ -233,6 +241,8 @@ fn second_handle_sees_writes_from_first() {
                 to: None,
                 text: "from a".into(),
                 from_team: None,
+                attachments: vec![],
+                chat: None,
             },
         )
         .unwrap();
@@ -262,6 +272,8 @@ fn concurrent_writers_keep_seq_gapless() {
                             to: None,
                             text: format!("{w}-{i}"),
                             from_team: None,
+                            attachments: vec![],
+                            chat: None,
                         },
                     )
                     .unwrap();
@@ -321,6 +333,8 @@ fn torn_tail_is_ignored_then_repaired() {
                 to: None,
                 text: "after crash".into(),
                 from_team: None,
+                attachments: vec![],
+                chat: None,
             },
         )
         .unwrap();
@@ -500,6 +514,7 @@ fn snapshot_names_are_safe_and_collisions_fall_back_to_full_id() {
         Command::Comment {
             task: "a1b2c3d4-0002-x".into(),
             text: "hi".into(),
+            attachments: vec![],
         },
     )
     .unwrap();
@@ -710,4 +725,27 @@ fn wave3_events_persist_replay_and_link_snapshots_both_tasks() {
             rteams_core::CoreError::TeamDeleted
         ))
     ));
+}
+
+#[test]
+fn permanent_delete_only_from_trash_or_draft() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = FileStore::open(tmp.path(), "t").unwrap();
+    setup(&mut s);
+    drop(s);
+    // Live team: refused, still there.
+    let err = FileStore::delete_team_permanently(tmp.path(), "t").unwrap_err();
+    assert!(matches!(err, StoreError::Forbidden(_)));
+    assert!(tmp.path().join("t").exists());
+    // In the trash: gone.
+    let mut s = FileStore::open(tmp.path(), "t").unwrap();
+    s.execute("lead", 5, Command::DeleteTeam { deleted: true })
+        .unwrap();
+    drop(s);
+    FileStore::delete_team_permanently(tmp.path(), "t").unwrap();
+    assert!(!tmp.path().join("t").exists());
+    // A draft (log with no team) is removable too; bad names are refused.
+    drop(FileStore::open(tmp.path(), "draft").unwrap());
+    FileStore::delete_team_permanently(tmp.path(), "draft").unwrap();
+    assert!(FileStore::delete_team_permanently(tmp.path(), "../x").is_err());
 }

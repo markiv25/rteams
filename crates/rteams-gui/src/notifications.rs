@@ -104,6 +104,7 @@ pub struct NotificationCenter {
     prefs: NotifyPrefs,
     is_open: bool,
     path: Option<PathBuf>,
+    test_sent: bool,
 }
 
 /// Read the `"notify"` key of a gui-state file (defaults when missing or unreadable).
@@ -208,6 +209,30 @@ impl NotificationCenter {
                 save_prefs(path, &self.prefs);
             }
         }
+        ui.add_space(6.0);
+        ui.label(RichText::new(tr.t("settings.notifications.test.label")).strong());
+        ui.label(
+            RichText::new(tr.t("settings.notifications.test.description")).color(theme::TEXT_2),
+        );
+        if theme::pill_button(ui, &tr.t("settings.notifications.test.action"), false).clicked() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            let (title, body) = self.record_test(ts);
+            crate::notify::notify(&title, &body);
+            self.test_sent = true;
+        }
+        if self.test_sent {
+            ui.colored_label(theme::SUCCESS, tr.t("settings.notifications.test.sent"));
+        }
+    }
+
+    /// The "send test notification" action: adds a history entry (ignoring the per-type
+    /// toggles, since it tests delivery) and returns the text to show as an OS notification.
+    pub fn record_test(&mut self, ts: i64) -> (String, String) {
+        let (title, body) = ("rteams".to_string(), "Test notification".to_string());
+        self.push(&title, &body, ts);
+        (title, body)
     }
 
     /// The dropdown window, anchored top right. Opening it does not mark anything read.
@@ -303,6 +328,16 @@ mod tests {
             c.push("x", "y", i);
         }
         assert_eq!(c.len(), MAX_HISTORY);
+    }
+
+    #[test]
+    fn test_notification_is_recorded_even_when_all_off() {
+        let mut c = NotificationCenter::default();
+        c.prefs.task_done = false;
+        c.prefs.messages = false;
+        let (t, b) = c.record_test(9);
+        assert_eq!((t.as_str(), b.as_str()), ("rteams", "Test notification"));
+        assert_eq!((c.len(), c.unread()), (1, 1));
     }
 
     #[test]

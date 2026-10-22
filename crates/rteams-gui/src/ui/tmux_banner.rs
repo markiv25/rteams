@@ -34,6 +34,7 @@ enum Act {
     AskInstall,
     ConfirmInstall,
     CancelConfirm,
+    CancelInstall,
     Dismiss,
     Recheck,
 }
@@ -45,6 +46,8 @@ pub struct TmuxBanner {
     show_cmd: bool,
     confirm: bool,
     log: Vec<String>,
+    /// The installer printed a password/terminal prompt: it must be run in a real terminal.
+    needs_terminal: bool,
     probe: Option<Receiver<Option<String>>>,
     run: Option<InstallRun>,
 }
@@ -58,6 +61,7 @@ impl Default for TmuxBanner {
             show_cmd: false,
             confirm: false,
             log: vec![],
+            needs_terminal: false,
             probe: None,
             run: None,
         }
@@ -104,6 +108,7 @@ impl TmuxBanner {
             for e in run.poll() {
                 match e {
                     InstallEvent::Line(l) => {
+                        self.needs_terminal |= tmux::needs_input(&l);
                         self.log.push(l);
                         if self.log.len() > LOG_CAP {
                             self.log.remove(0);
@@ -118,6 +123,7 @@ impl TmuxBanner {
             self.run = None;
             match r {
                 Ok(()) => self.start_probe(ctx),
+                Err(e) if e == "cancelled" => self.phase = Phase::Missing,
                 Err(e) => self.phase = Phase::Failed(e),
             }
         }
@@ -148,10 +154,16 @@ impl TmuxBanner {
                 self.confirm = true;
             }
             Act::CancelConfirm => self.confirm = false,
+            Act::CancelInstall => {
+                if let Some(r) = &self.run {
+                    r.cancel();
+                }
+            }
             Act::ConfirmInstall => {
                 self.confirm = false;
                 if let Some(cmd) = &self.cmd {
                     self.log.clear();
+                    self.needs_terminal = false;
                     match tmux::run(cmd) {
                         Ok(r) => {
                             self.run = Some(r);
@@ -240,14 +252,30 @@ impl TmuxBanner {
                 if let Phase::Failed(e) = &self.phase {
                     ui.add_space(4.0);
                     ui.label(RichText::new(e).color(theme::ERROR_FG));
-                    ui.label(
-                        RichText::new(tx(
+                    let hint = if self.needs_terminal {
+                        tx(
+                            tr,
+                            "tmuxBanner.needsTerminal",
+                            "The installer asked for a password. rteams never collects passwords: run this command in a terminal, then press Re-check.",
+                        )
+                    } else {
+                        tx(
                             tr,
                             "tmuxBanner.failedHint",
                             "If it asked for a password, run the command in a terminal instead.",
-                        ))
-                        .color(theme::MUTED),
-                    );
+                        )
+                    };
+                    ui.label(RichText::new(hint).color(theme::MUTED));
+                    if let Some(t) = &cmd_text {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(t).monospace().background_color(theme::CODE_BG),
+                            );
+                            if ui.small_button(tx(tr, "common.actions.copy", "Copy")).clicked() {
+                                ui.ctx().copy_text(t.clone());
+                            }
+                        });
+                    }
                 }
                 if !self.log.is_empty() {
                     ui.add_space(4.0);
@@ -285,6 +313,12 @@ impl TmuxBanner {
                     if installing {
                         ui.spinner();
                         ui.label(tx(tr, "tmuxBanner.installing", "Installing\u{2026}"));
+                        if ui
+                            .button(tx(tr, "common.actions.cancel", "Cancel"))
+                            .clicked()
+                        {
+                            act = Some(Act::CancelInstall);
+                        }
                         return;
                     }
                     if ui
@@ -340,6 +374,42 @@ mod tests {
         b.show_cmd = true;
         assert!(render_once(&mut b).is_none()); // no click happened
         assert!(b.run.is_none(), "rendering must not start an install");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_install_returns_to_missing_not_failed() {
+        let ctx = egui::Context::default();
+        let mut b = TmuxBanner {
+            phase: Phase::Installing,
+            run: Some(tmux::run(&["sleep".into(), "30".into()]).unwrap()),
+            ..TmuxBanner::default()
+        };
+        b.run.as_ref().unwrap().cancel();
+        for _ in 0..100 {
+            b.poll(&ctx);
+            if b.run.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(b.phase, Phase::Missing);
+    }
+
+    #[test]
+    fn failed_with_password_prompt_renders_terminal_hint() {
+        let mut b = TmuxBanner {
+            phase: Phase::Failed("exited with 1".into()),
+            needs_terminal: true,
+            cmd: Some(vec![
+                "sudo".into(),
+                "apt-get".into(),
+                "install".into(),
+                "tmux".into(),
+            ]),
+            ..TmuxBanner::default()
+        };
+        assert!(render_once(&mut b).is_none());
     }
 
     #[test]

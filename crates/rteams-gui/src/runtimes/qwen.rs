@@ -52,6 +52,9 @@ impl AgentRuntime for Qwen {
     fn session_id(&self, line: &str) -> Option<String> {
         QWEN.session_id(line)
     }
+    fn login_command(&self) -> Option<&'static str> {
+        Some("qwen")
+    }
     fn supports_resume(&self) -> bool {
         false
     }

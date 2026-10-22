@@ -4,6 +4,6 @@ pub mod platform;
 pub mod runner;
 pub mod strategy;
 
-pub use platform::{current_os, detect_tmux, Os};
+pub use platform::{current_os, detect_tmux, needs_input, Os};
 pub use runner::{run, InstallEvent, InstallRun};
 pub use strategy::{display, install_command, Strategy};

@@ -87,6 +87,16 @@ pub trait Store {
         Ok(self.execute_with_id(actor, ts, None, cmd)?.event)
     }
 
+    /// The directory holding every team of this store (sibling teams), if it has one.
+    fn home(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// This team's directory name (its stable id), if the store has one.
+    fn team_dir(&self) -> Option<String> {
+        None
+    }
+
     fn events(&mut self) -> Result<&[Event], StoreError>;
     fn state(&mut self) -> Result<&State, StoreError>;
 }

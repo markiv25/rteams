@@ -120,6 +120,12 @@ pub struct Teams {
     confirm: Option<String>,
     /// `(team dir, deleted)` the user asked for; the shell polls `take_delete_request`.
     request: Option<(String, bool)>,
+    /// Team dir the user confirmed to delete forever (it was already in the trash).
+    purge_request: Option<String>,
+    /// Rename dialog open for `(team dir, name being typed)`.
+    renaming: Option<(String, String)>,
+    /// `(team dir, new display name)` confirmed in the dialog; polled by `take_rename_request`.
+    rename_request: Option<(String, String)>,
 }
 
 impl Teams {
@@ -128,10 +134,22 @@ impl Teams {
         self.cards = None;
     }
 
+    /// A confirmed rename `(team dir, new display name)`; the shell runs `GuiCmd::RenameTeam`
+    /// against that team and then calls `invalidate`.
+    pub fn take_rename_request(&mut self) -> Option<(String, String)> {
+        self.rename_request.take()
+    }
+
     /// A pending delete (`true`) or restore (`false`) of the team in `.0`; the shell runs
     /// `GuiCmd::DeleteTeam` against that team and then calls `invalidate`.
     pub fn take_delete_request(&mut self) -> Option<(String, bool)> {
         self.request.take()
+    }
+
+    /// A confirmed permanent delete of a trashed team; the shell calls
+    /// `FileStore::delete_team_permanently` and then `invalidate`.
+    pub fn take_purge_request(&mut self) -> Option<String> {
+        self.purge_request.take()
     }
 
     /// A header button the shell must act on (`Org Map`).
@@ -297,6 +315,37 @@ impl Teams {
         if let Some(d) = self.import.show(ctx, tr, home, &[]) {
             self.draft = Some(d);
         }
+        self.rename_dialog(ctx, tr);
+    }
+
+    fn rename_dialog(&mut self, ctx: &egui::Context, tr: &I18n) {
+        let Some((dir, text)) = &mut self.renaming else {
+            return;
+        };
+        let mut done = None;
+        egui::Window::new(tr.t("rteams.teams.rename"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let edit = ui.add(egui::TextEdit::singleline(text).desired_width(280.0));
+                edit.request_focus();
+                let ok = !text.trim().is_empty();
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.horizontal(|ui| {
+                    if theme::pill_button(ui, &tr.t("common.actions.cancel"), false).clicked() {
+                        done = Some(None);
+                    }
+                    let save = ui.add_enabled(ok, egui::Button::new(tr.t("common.actions.save")));
+                    if (save.clicked() || (enter && ok)) && ok {
+                        done = Some(Some((dir.clone(), text.trim().to_string())));
+                    }
+                });
+            });
+        if let Some(d) = done {
+            self.renaming = None;
+            self.rename_request = d;
+        }
     }
 
     fn card(
@@ -389,9 +438,29 @@ impl Teams {
     }
 
     fn card_actions(&mut self, ui: &mut egui::Ui, tr: &I18n, c: &TeamCard) {
-        if c.deleted {
+        if c.deleted && self.confirm.as_deref() == Some(c.dir.as_str()) {
+            if theme::pill_button(ui, &tr.t("common.actions.cancel"), false).clicked() {
+                self.confirm = None;
+            }
+            let label = if tr.has("rteams.teams.deleteForever") {
+                tr.t("rteams.teams.deleteForever")
+            } else {
+                "Delete forever".to_string()
+            };
+            let b = egui::Button::new(RichText::new(label).color(theme::ERROR))
+                .corner_radius(egui::CornerRadius::same(255));
+            if ui.add(b).clicked() {
+                self.purge_request = Some(c.dir.clone());
+                self.confirm = None;
+            }
+        } else if c.deleted {
             if theme::pill_button(ui, &tr.t("team.kanban.trash.restore"), false).clicked() {
                 self.request = Some((c.dir.clone(), false));
+            }
+            if theme::icon_button(ui, Icon::Trash, &tr.t("common.notifications.row.delete"))
+                .clicked()
+            {
+                self.confirm = Some(c.dir.clone());
             }
         } else if self.confirm.as_deref() == Some(c.dir.as_str()) {
             if theme::pill_button(ui, &tr.t("common.actions.cancel"), false).clicked() {
@@ -405,10 +474,15 @@ impl Teams {
                 self.request = Some((c.dir.clone(), true));
                 self.confirm = None;
             }
-        } else if theme::icon_button(ui, Icon::Trash, &tr.t("common.notifications.row.delete"))
-            .clicked()
-        {
-            self.confirm = Some(c.dir.clone());
+        } else {
+            if theme::icon_button(ui, Icon::Trash, &tr.t("common.notifications.row.delete"))
+                .clicked()
+            {
+                self.confirm = Some(c.dir.clone());
+            }
+            if theme::icon_button(ui, Icon::Edit, &tr.t("rteams.teams.rename")).clicked() {
+                self.renaming = Some((c.dir.clone(), c.name.clone().unwrap_or_default()));
+            }
         }
     }
 }
@@ -458,6 +532,40 @@ mod tests {
         teams.request = Some(("t".into(), false));
         assert_eq!(teams.take_delete_request(), Some(("t".into(), false)));
         assert_eq!(teams.take_delete_request(), None);
+        // Deleting forever is a separate, confirmed request for a trashed team.
+        teams.purge_request = Some("t".into());
+        assert_eq!(teams.take_purge_request().as_deref(), Some("t"));
+        assert_eq!(teams.take_purge_request(), None);
+        rteams_store::FileStore::delete_team_permanently(&home, "t").unwrap();
+        assert!(scan(&home).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rename_keeps_dir_and_shows_new_name() {
+        let (home, _d) = crate::view::testing::fixture("teamsren");
+        let mut c = crate::actions::Commander::new(home.clone(), "t".into());
+        c.run(
+            "boss",
+            &crate::actions::GuiCmd::RenameTeam {
+                name: "Fresh Name".into(),
+            },
+        )
+        .unwrap();
+        let cards = scan(&home);
+        assert_eq!(cards[0].dir, "t");
+        assert_eq!(cards[0].name.as_deref(), Some("Fresh Name"));
+        let mut teams = Teams {
+            renaming: Some(("t".into(), "Fresh Name".into())),
+            ..Default::default()
+        };
+        let mut out = Intents::default();
+        crate::view::testing::render(|ui| {
+            teams.show(ui, crate::view::testing::tr(), &home, "t", &mut out)
+        });
+        assert_eq!(teams.take_rename_request(), None);
+        teams.rename_request = Some(("t".into(), "X".into()));
+        assert_eq!(teams.take_rename_request(), Some(("t".into(), "X".into())));
         let _ = std::fs::remove_dir_all(&home);
     }
 

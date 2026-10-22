@@ -18,7 +18,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+#[cfg(test)]
+use crate::diagnostics::SpawnState;
+use crate::diagnostics::{self, Cause, DiagEnv, LaunchDiag, LaunchRecord};
 use crate::runtimes::{self, AgentRuntime, LaunchCtx};
+use crate::task_logs;
 
 /// Max lines kept per agent.
 const RING: usize = 200;
@@ -82,6 +86,18 @@ pub struct AgentSpec {
     pub solo: bool,
     /// Extra environment for the agent process (API keys for its runtime).
     pub env: Vec<(String, String)>,
+    /// `low|medium|high|xhigh|max`; mapped to each runtime's effort flag where one exists.
+    pub effort: Option<String>,
+    /// Fast mode (Claude `fastMode` setting, Codex `service_tier=fast`).
+    pub fast: bool,
+    /// Context window cap in tokens (Codex `model_context_window`; Claude drops `[1m]`).
+    pub context_limit: Option<u32>,
+    /// Per-launch permissions override of the team-wide setting.
+    pub permissions: Option<Permissions>,
+    /// Extra MCP server names (from the user's MCP config) the agent may use beside `rteams`.
+    pub mcp_allow: Vec<String>,
+    /// User CLI flags appended to the Claude command (validated by `validate_extra_args`).
+    pub extra_args: Vec<String>,
 }
 
 impl Default for AgentSpec {
@@ -101,6 +117,12 @@ impl Default for AgentSpec {
             project: None,
             solo: false,
             env: Vec::new(),
+            effort: None,
+            fast: false,
+            context_limit: None,
+            permissions: None,
+            mcp_allow: Vec::new(),
+            extra_args: Vec::new(),
         }
     }
 }
@@ -192,11 +214,19 @@ fn system_prompt(spec: &AgentSpec) -> String {
          1. Call member_briefing once, then task_briefing; take the FIRST actionable task only.\n\
          2. task_start, do the work, add ONE concise task_add_comment with the result (what \
          changed, where), then task_complete (or review_request if your role/flow needs review).\n\
-         3. Do NOT send messages, greetings, acknowledgements or status updates. Use \
-         message_send only when blocked (with task_block), addressed to the lead.\n\
+         3. Do NOT send messages, greetings, acknowledgements or status updates. Exceptions: \
+         when a person messaged you (direct or group chat) with a question or request, answer \
+         them ONCE with message_send to that sender, short and concrete; when blocked \
+         (with task_block), message the lead; and you may message the lead privately (direct, \
+         not group chat) about a real concern you'd rather not raise in front of the team.\n\
          4. Never re-call briefings or the inbox in loops. With no actionable task, stop \
          immediately.\n\
-         5. Keep tool inputs and comments short.",
+         5. Keep tool inputs and comments short.\n\
+         6. Everything a person will read (messages, task comments) is ONLY bullet points: \
+         each on its own line starting with \"- \", one idea, <= 15 words, at most 6; no \
+         intro, recap, filler or inline \"1) 2)\" lists. They will ask if they need more.\n\
+         7. Call runtime_bootstrap_checkin once at start; call runtime_heartbeat with status \
+         \"stuck\" and a note when blocked.",
         m = spec.member,
         r = spec.role,
         d = spec.workdir.display()
@@ -236,6 +266,34 @@ fn system_prompt(spec: &AgentSpec) -> String {
     s
 }
 
+/// MCP servers named in `names`, looked up in the user's Claude MCP config (project + user
+/// scopes), as `{command,args,env}` / `{url}` JSON. Unknown or disabled names are skipped.
+pub fn resolve_mcp_allow(names: &[String], project: Option<&Path>) -> Vec<(String, Value)> {
+    use rteams_services::ext::mcp_config as mc;
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let paths = mc::ClientPaths::real(project.map(Path::to_path_buf));
+    let (installed, _) = mc::list(&paths, mc::Runtime::Claude);
+    let mut out: Vec<(String, Value)> = Vec::new();
+    for n in names.iter().filter(|n| n.as_str() != "rteams") {
+        if out.iter().any(|(k, _)| k == n) {
+            continue;
+        }
+        let Some(s) = installed.iter().find(|s| &s.name == n && s.enabled) else {
+            continue;
+        };
+        let e = &s.spec;
+        let v = if matches!(e.transport, mc::Transport::Stdio) {
+            json!({"command": e.command, "args": e.args, "env": e.env})
+        } else {
+            json!({"url": e.url, "headers": e.headers})
+        };
+        out.push((n.clone(), v));
+    }
+    out
+}
+
 /// Tools denied outright for the restricted modes.
 const NO_EDIT: &str = "Edit,Write,NotebookEdit,Bash";
 
@@ -247,12 +305,25 @@ const NO_EDIT: &str = "Edit,Write,NotebookEdit,Bash";
 /// --append-system-prompt <text>`. The prompt comes right after `-p` and variadic options use
 /// `=` so they cannot swallow it. The spawned process leads its own process group.
 pub fn build_command(cfg: &LaunchConfig, spec: &AgentSpec) -> Command {
-    let mcp = json!({"mcpServers": {"rteams": {
-        "command": cfg.rteams_bin,
-        "args": ["serve", "--home", cfg.home.to_string_lossy(), "--team", cfg.team],
-        "env": {"RTEAMS_MEMBER": spec.member},
-    }}});
+    let extras = resolve_mcp_allow(&spec.mcp_allow, spec.project.as_deref());
+    let mut servers = serde_json::Map::new();
+    for (k, v) in &extras {
+        servers.insert(k.clone(), v.clone());
+    }
+    servers.insert(
+        "rteams".into(),
+        json!({
+            "command": cfg.rteams_bin,
+            "args": ["serve", "--home", cfg.home.to_string_lossy(), "--team", cfg.team],
+            "env": {"RTEAMS_MEMBER": spec.member},
+        }),
+    );
+    let mcp = json!({ "mcpServers": servers });
     let mut allowed = String::from("mcp__rteams");
+    for (k, _) in &extras {
+        allowed.push_str(",mcp__");
+        allowed.push_str(k);
+    }
     match spec.mode {
         Mode::Do => {}
         Mode::Ask => allowed.push_str(",Read,Grep,Glob"),
@@ -269,7 +340,7 @@ pub fn build_command(cfg: &LaunchConfig, spec: &AgentSpec) -> Command {
     if spec.mode != Mode::Do {
         cmd.arg(format!("--disallowedTools={NO_EDIT}"));
     }
-    match cfg.permissions {
+    match spec.permissions.as_ref().unwrap_or(&cfg.permissions) {
         Permissions::SkipAll => {
             cmd.arg("--dangerously-skip-permissions");
         }
@@ -288,14 +359,136 @@ pub fn build_command(cfg: &LaunchConfig, spec: &AgentSpec) -> Command {
         }
     }
     if let Some(m) = spec.model.as_deref().filter(|m| !m.trim().is_empty()) {
-        cmd.arg("--model").arg(m.trim());
+        cmd.arg("--model")
+            .arg(claude_model(m.trim(), spec.context_limit));
+    }
+    if let Some(e) = spec
+        .effort
+        .as_deref()
+        .filter(|e| matches!(*e, "low" | "medium" | "high" | "xhigh" | "max"))
+    {
+        cmd.arg("--effort").arg(e);
+    }
+    if spec.fast {
+        cmd.arg("--settings").arg(r#"{"fastMode":true}"#);
     }
     if let Some(id) = spec.session.as_deref().filter(|_| spec.resume) {
         cmd.arg("--resume").arg(id);
     }
+    cmd.args(&spec.extra_args);
     cmd.arg("--append-system-prompt").arg(system_prompt(spec));
     finish_command(&mut cmd, &spec.workdir);
     cmd
+}
+
+/// Flags rteams sets itself; user extra args may not override them.
+const PROTECTED_FLAGS: [&str; 16] = [
+    "-p",
+    "--print",
+    "--output-format",
+    "--input-format",
+    "--verbose",
+    "--mcp-config",
+    "--strict-mcp-config",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--dangerously-skip-permissions",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--resume",
+    "--append-system-prompt",
+];
+
+/// Splits `raw` like a shell would (whitespace, single/double quotes).
+pub fn split_args(raw: &str) -> Result<Vec<String>, String> {
+    let (mut out, mut cur, mut quote, mut any) = (Vec::new(), String::new(), None, false);
+    for c in raw.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                any = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if any || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                any = false;
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if quote.is_some() {
+        return Err("unclosed quote".into());
+    }
+    if any || !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+/// Checks user extra CLI args: max 2048 chars, no flag rteams sets itself, and (when `help`
+/// is given, i.e. `claude --help` output) only flags the CLI knows. Returns the split args.
+pub fn validate_extra_args(raw: &str, help: Option<&str>) -> Result<Vec<String>, String> {
+    if raw.len() > 2048 {
+        return Err("too long (max 2048)".into());
+    }
+    let args = split_args(raw)?;
+    let flag = |a: &str| a.split('=').next().unwrap_or(a).to_string();
+    let flags: Vec<String> = args
+        .iter()
+        .filter(|a| a.starts_with('-'))
+        .map(|a| flag(a))
+        .collect();
+    let protected: Vec<&String> = flags
+        .iter()
+        .filter(|f| PROTECTED_FLAGS.contains(&f.as_str()))
+        .collect();
+    if !protected.is_empty() {
+        let l: Vec<&str> = protected.iter().map(|s| s.as_str()).collect();
+        return Err(format!("set by rteams: {}", l.join(", ")));
+    }
+    if let Some(help) = help {
+        let known = |f: &str| {
+            help.match_indices(f).any(|(i, _)| {
+                let next = help[i + f.len()..].chars().next();
+                !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+        };
+        let unknown: Vec<&str> = flags
+            .iter()
+            .map(String::as_str)
+            .filter(|f| !known(f))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!("unknown flags: {}", unknown.join(", ")));
+        }
+    }
+    Ok(args)
+}
+
+/// `claude --help` output, run once per process; `None` if the CLI could not be run.
+pub fn claude_help() -> Option<&'static str> {
+    static HELP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HELP.get_or_init(|| {
+        let bin = LaunchConfig::new(PathBuf::new(), "").claude_bin;
+        let out = Command::new(bin).arg("--help").output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+    .as_deref()
+}
+
+/// A context cap of 200k or less drops the `[1m]` long-context suffix from a Claude model.
+fn claude_model(m: &str, limit: Option<u32>) -> String {
+    match limit {
+        Some(l) if l <= 200_000 => m.replace("[1m]", ""),
+        _ => m.to_string(),
+    }
 }
 
 /// cwd, piped stdio and a process group of its own, for any runtime's command.
@@ -342,19 +535,28 @@ fn command_for(cfg: &LaunchConfig, spec: &AgentSpec, rt: Option<&dyn AgentRuntim
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty())
-            .map(str::to_string),
+            .map(|m| claude_model(m, spec.context_limit)),
         mode: match spec.mode {
             Mode::Do => "do",
             Mode::Ask => "ask",
             Mode::Delegate => "delegate",
         }
         .into(),
-        permissions: cfg.permissions.as_str().into(),
+        permissions: spec
+            .permissions
+            .as_ref()
+            .unwrap_or(&cfg.permissions)
+            .as_str()
+            .into(),
         resume: spec
             .session
             .clone()
             .filter(|_| spec.resume && rt.supports_resume()),
         workdir: spec.workdir.clone(),
+        effort: spec.effort.clone(),
+        fast: spec.fast,
+        context_limit: spec.context_limit,
+        extra_mcp: resolve_mcp_allow(&spec.mcp_allow, spec.project.as_deref()),
     };
     let mut cmd = rt.build_command(&ctx);
     finish_command(&mut cmd, &spec.workdir);
@@ -761,6 +963,10 @@ struct Entry {
     runtime: String,
     limited: Arc<Mutex<Option<i64>>>,
     last_error: Arc<Mutex<Option<String>>>,
+    /// Launch facts and diagnosis (also published for the team page).
+    rec: Arc<Mutex<LaunchRecord>>,
+    /// Stopped on purpose: its exit is not a launch failure.
+    stopped: bool,
 }
 
 /// Key of the member's session in `sessions.json`: plain member for Claude, `member@runtime`
@@ -783,6 +989,11 @@ pub struct Supervisor {
 impl Supervisor {
     pub fn new(cfg: LaunchConfig) -> Self {
         let sessions = load_sessions(&Self::sessions_path(&cfg));
+        {
+            // Earlier runs feed the per-task logs; runs from now on come in live.
+            let (home, team, before) = (cfg.home.clone(), cfg.team.clone(), unix_ms() as i64);
+            thread::spawn(move || task_logs::load_history(&home, &team, before));
+        }
         Supervisor {
             cfg,
             agents: BTreeMap::new(),
@@ -878,20 +1089,25 @@ impl Supervisor {
             }
         }
         if spec.worktree {
-            if let Some(project) = spec.project.as_deref() {
-                spec.workdir = crate::git::ensure_worktree(
-                    project,
+            if let Some(project) = spec.project.clone() {
+                if let Some(why) = diagnostics::readiness(&project).blocker() {
+                    let msg = format!("worktree not ready: {why}");
+                    return Err(self.reject(spec, msg, Cause::WorktreeNotReady));
+                }
+                match crate::git::ensure_worktree(
+                    &project,
                     &self.cfg.home,
                     &self.cfg.team,
                     &spec.member,
-                )?;
+                ) {
+                    Ok(w) => spec.workdir = w,
+                    Err(e) => return Err(self.reject(spec, e, Cause::WorktreeNotReady)),
+                }
             }
         }
         if !Path::new(&spec.workdir).is_dir() {
-            return Err(format!(
-                "workdir {} is not a directory",
-                spec.workdir.display()
-            ));
+            let msg = format!("workdir {} is not a directory", spec.workdir.display());
+            return Err(self.reject(spec, msg, Cause::WorkdirMissing));
         }
         let rt: Option<Arc<dyn AgentRuntime>> =
             runtimes::get(spec.runtime.as_deref()).map(Arc::from);
@@ -915,10 +1131,30 @@ impl Supervisor {
         };
         let mut cmd = command_for(&self.cfg, &spec, rt.as_deref());
         cmd.envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let mut child = cmd.spawn().map_err(|e| format!("spawn {bin_name}: {e}"))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let cause = if e.kind() == std::io::ErrorKind::NotFound {
+                    Cause::CliNotFound
+                } else {
+                    Cause::Unknown
+                };
+                let msg = format!("spawn {bin_name}: {e}");
+                return Err(self.reject(spec, msg, cause));
+            }
+        };
         track_group(child.id(), true);
+        task_logs::reset_member(&self.cfg.team, &spec.member);
+        crate::context_usage::reset(&self.cfg.team, &spec.member);
+        let ctx_window =
+            crate::context_usage::window_for(spec.model.as_deref(), spec.context_limit);
         let lines: Ring = Arc::default();
         let events = Arc::new(AtomicUsize::new(0));
+        let rec = Arc::new(Mutex::new(LaunchRecord::new(
+            unix_ms() as i64,
+            events.clone(),
+        )));
+        diagnostics::publish(&self.cfg.team, &spec.member, rec.clone());
         let limited: Arc<Mutex<Option<i64>>> = Arc::default();
         let last_error: Arc<Mutex<Option<String>>> = Arc::default();
         let mut readers = Vec::new();
@@ -931,8 +1167,14 @@ impl Supervisor {
             let limited = limited.clone();
             let last_error = last_error.clone();
             let mut tee = self.open_run_file(&spec.member);
+            let (team, member) = (self.cfg.team.clone(), spec.member.clone());
+            let rt_name = rt_id.clone();
             readers.push(thread::spawn(move || {
+                // Only Claude's window is known from the model; others show tokens alone.
+                let window = (rt_name == "claude").then_some(ctx_window);
                 for l in BufReader::new(out).lines().map_while(Result::ok) {
+                    task_logs::ingest(&team, &member, unix_ms() as i64, &l);
+                    crate::context_usage::ingest(&team, &member, &rt_name, window, &l);
                     if let Some(f) = tee.as_mut() {
                         let _ = writeln!(f, "{l}");
                     }
@@ -992,17 +1234,69 @@ impl Supervisor {
                 runtime: rt_id,
                 limited,
                 last_error,
+                rec,
+                stopped: false,
             },
         );
         Ok(())
     }
 
+    /// Record a launch that never got a process: the member shows as failed with a diagnosis.
+    /// Returns the message to hand back as the launch error.
+    fn reject(&mut self, spec: AgentSpec, msg: String, cause: Cause) -> String {
+        let line = format!("error: {msg}");
+        let lines: Ring = Arc::default();
+        push(&lines, line.clone());
+        let mut rec = LaunchRecord::new(unix_ms() as i64, Arc::default());
+        rec.ended_ms = rec.started_ms.into();
+        rec.rejected = true;
+        rec.diag = Some(LaunchDiag {
+            cause,
+            code: None,
+            detail: Some(line.clone()),
+            tail: vec![line],
+        });
+        let rec = Arc::new(Mutex::new(rec));
+        diagnostics::publish(&self.cfg.team, &spec.member, rec.clone());
+        let rt = spec.runtime.clone().unwrap_or_else(|| "claude".into());
+        self.agents.insert(
+            spec.member.clone(),
+            Entry {
+                child: None,
+                status: AgentStatus::Failed(msg.clone()),
+                lines,
+                readers: Vec::new(),
+                spec,
+                resumed: false,
+                events: Arc::default(),
+                runtime: rt,
+                limited: Arc::default(),
+                last_error: Arc::new(Mutex::new(Some(msg.clone()))),
+                rec,
+                stopped: false,
+            },
+        );
+        msg
+    }
+
+    /// Launch record of the member's latest launch (this supervisor's).
+    #[cfg(test)]
+    pub fn launch_record(&self, member: &str) -> Option<LaunchRecord> {
+        let e = self.agents.get(member)?;
+        let g = e.rec.lock().unwrap_or_else(|p| p.into_inner());
+        Some(g.clone())
+    }
+
     /// Terminate the member's whole process group (SIGTERM, then SIGKILL after ~2s if anything
     /// is still alive) without blocking. No-op if not running. Status settles on `poll()`.
     pub fn stop(&mut self, member: &str) {
-        let Some(child) = self.agents.get_mut(member).and_then(|e| e.child.as_mut()) else {
+        let Some(e) = self.agents.get_mut(member) else {
             return;
         };
+        let Some(child) = e.child.as_mut() else {
+            return;
+        };
+        e.stopped = true;
         let pgid = child.id();
         if !signal_group("TERM", pgid) {
             let _ = child.kill();
@@ -1063,6 +1357,37 @@ impl Supervisor {
                 // Pipes hit EOF once the child is gone; let readers drain what is buffered.
                 for h in e.readers.drain(..) {
                     let _ = h.join();
+                }
+                if !e.stopped {
+                    let now = unix_ms() as i64;
+                    let lines: Vec<String> = e
+                        .lines
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .iter()
+                        .cloned()
+                        .collect();
+                    let code = match e.status {
+                        AgentStatus::Exited { code } => code,
+                        _ => None,
+                    };
+                    let mut rec = e.rec.lock().unwrap_or_else(|p| p.into_inner());
+                    if rec.ended_ms.is_none() {
+                        rec.ended_ms = Some(now);
+                        let env = DiagEnv {
+                            cli_found: true,
+                            workdir_ok: e.spec.workdir.is_dir(),
+                        };
+                        rec.diag = diagnostics::diagnose_exit(
+                            code,
+                            now - rec.started_ms,
+                            e.events.load(Ordering::SeqCst),
+                            &lines,
+                            env,
+                        );
+                    }
+                } else if let Ok(mut rec) = e.rec.lock() {
+                    rec.ended_ms.get_or_insert(unix_ms() as i64);
                 }
                 // A resumed run that failed straight away: the session is unusable.
                 let failed = matches!(e.status, AgentStatus::Exited { code: Some(c) } if c != 0);
@@ -1281,6 +1606,20 @@ mod tests {
     }
 
     #[test]
+    fn context_usage_tracked_from_stream() {
+        let dir = tmp("ctxusage");
+        let body = r#"echo '{"type":"assistant","message":{"content":[],"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":70}}}'"#;
+        let mut sup = Supervisor::new(fake_claude(&dir, body));
+        let mut s = spec(&dir, "ctxbob");
+        s.model = Some("opus[1m]".into());
+        sup.launch(s).unwrap();
+        wait_until(&mut sup, |v| matches!(v.status, AgentStatus::Exited { .. }));
+        let u = crate::context_usage::get("t", "ctxbob").unwrap();
+        assert_eq!((u.tokens, u.window), (100, Some(1_000_000)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn failed_resume_clears_session() {
         let dir = tmp("badresume");
         std::fs::create_dir_all(dir.join("t")).unwrap();
@@ -1342,6 +1681,42 @@ mod tests {
     }
 
     #[test]
+    fn extra_args_validation() {
+        assert_eq!(
+            split_args(r#"--add-dir "/a b" -x 'q r'"#).unwrap(),
+            ["--add-dir", "/a b", "-x", "q r"]
+        );
+        assert!(split_args("--x \"open").is_err());
+        let help = "  --add-dir <dirs>  Extra dirs\n  --model <m>\n  --fallback-model <m>";
+        assert_eq!(
+            validate_extra_args("--add-dir /tmp", Some(help)).unwrap(),
+            ["--add-dir", "/tmp"]
+        );
+        assert!(validate_extra_args("--model=x", Some(help)).is_ok());
+        assert!(
+            validate_extra_args("--fallback", Some(help)).is_err(),
+            "prefix is not a flag"
+        );
+        assert!(validate_extra_args("--resume abc", None)
+            .unwrap_err()
+            .contains("--resume"));
+        assert!(validate_extra_args("--dangerously-skip-permissions", Some(help)).is_err());
+        assert!(validate_extra_args(&"a".repeat(3000), None).is_err());
+        let spec = AgentSpec {
+            extra_args: vec!["--add-dir".into(), "/tmp".into()],
+            ..Default::default()
+        };
+        let cfg = LaunchConfig::new(PathBuf::from("/tmp/h"), "t");
+        let args: Vec<String> = build_command(&cfg, &spec)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let i = args.iter().position(|a| a == "--add-dir").unwrap();
+        assert_eq!(args[i + 1], "/tmp");
+        assert_eq!(args[i + 2], "--append-system-prompt");
+    }
+
+    #[test]
     fn command_args() {
         let cfg = cfg_plain();
         let cmd = build_command(&cfg, &spec(Path::new("/w"), "alice"));
@@ -1367,7 +1742,44 @@ mod tests {
         assert!(sp.contains("Do NOT send messages"));
         assert!(!sp.contains("inbox_get") && !sp.contains("Poll"));
         assert!(sp.lines().count() <= 12);
+        assert!(sp.contains("ONLY bullet points"));
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/w")));
+    }
+
+    #[test]
+    fn launch_options_map_to_flags() {
+        let cfg = cfg_plain();
+        let mut s = spec(Path::new("/w"), "dev");
+        s.effort = Some("high".into());
+        s.fast = true;
+        s.model = Some("sonnet[1m]".into());
+        s.context_limit = Some(200_000);
+        s.permissions = Some(Permissions::SkipAll);
+        let a = args_of(&cfg, &s);
+        assert!(a.windows(2).any(|w| w == ["--effort", "high"]));
+        assert!(a.windows(2).any(|w| w == ["--model", "sonnet"]));
+        assert!(a.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(a.iter().any(|x| x.contains("fastMode")));
+        s.effort = Some("bogus".into());
+        assert!(!args_of(&cfg, &s).contains(&"--effort".to_string()));
+    }
+
+    #[test]
+    fn mcp_allow_ignores_unknown_servers() {
+        assert!(
+            resolve_mcp_allow(&["no-such-server-xyz".into(), "rteams".into()], None).is_empty()
+        );
+        let mut s = spec(Path::new("/w"), "dev");
+        s.mcp_allow = vec!["no-such-server-xyz".into()];
+        let a = args_of(&cfg_plain(), &s);
+        assert!(a.contains(&"--allowedTools=mcp__rteams".to_string()));
+    }
+
+    #[test]
+    fn prompt_tells_agents_to_heartbeat() {
+        let mut s = spec(Path::new("/w"), "dev");
+        s.role = "dev".into();
+        assert!(system_prompt(&s).contains("runtime_heartbeat"));
     }
 
     #[test]
@@ -1622,5 +2034,92 @@ echo oops >&2"#;
         bad.project = Some(dir.join("nope"));
         assert!(sup.launch(bad).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_exit_is_diagnosed_from_stderr() {
+        let dir = tmp("diag-exit");
+        let cfg = fake_claude(&dir, "echo \"error: unknown option '--bogus'\" >&2\nexit 2");
+        let mut sup = Supervisor::new(cfg);
+        sup.launch(spec(&dir, "ada")).unwrap();
+        wait_until(&mut sup, |a| {
+            !matches!(a.status, AgentStatus::Running { .. })
+        });
+        let rec = sup.launch_record("ada").unwrap();
+        let d = rec.diag.unwrap();
+        assert_eq!(d.cause, Cause::UnknownFlag);
+        assert_eq!(d.code, Some(2));
+        assert!(d.tail.iter().any(|l| l.contains("--bogus")));
+        assert!(rec.ended_ms.is_some() && !rec.rejected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clean_run_and_stopped_run_are_not_failures() {
+        let dir = tmp("diag-ok");
+        let cfg = fake_claude(
+            &dir,
+            "for i in 1 2 3; do echo '{\"type\":\"result\",\"result\":\"ok\"}'; done\nsleep 6",
+        );
+        let mut sup = Supervisor::new(cfg);
+        sup.launch(spec(&dir, "ada")).unwrap();
+        wait_until(&mut sup, |a| a.last_lines.len() >= 3);
+        assert_eq!(
+            SpawnState::of(true, &sup.launch_record("ada").unwrap(), None),
+            SpawnState::Running
+        );
+        sup.stop("ada");
+        wait_until(&mut sup, |a| {
+            !matches!(a.status, AgentStatus::Running { .. })
+        });
+        assert!(sup.launch_record("ada").unwrap().diag.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_cli_and_workdir_are_recorded_as_failed_members() {
+        let dir = tmp("diag-reject");
+        let mut cfg = fake_claude(&dir, "exit 0");
+        cfg.claude_bin = dir.join("nope").to_string_lossy().into_owned();
+        let mut sup = Supervisor::new(cfg);
+        assert!(sup.launch(spec(&dir, "ada")).is_err());
+        let d = sup.launch_record("ada").unwrap().diag.unwrap();
+        assert_eq!(d.cause, Cause::CliNotFound);
+        assert!(matches!(sup.agents()[0].status, AgentStatus::Failed(_)));
+        let missing = dir.join("gone");
+        assert!(sup.launch(spec(&missing, "bob")).is_err());
+        assert_eq!(
+            sup.launch_record("bob").unwrap().diag.unwrap().cause,
+            Cause::WorkdirMissing
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worktree_members_are_blocked_until_the_repo_is_ready() {
+        let dir = tmp("diag-wt");
+        let project = dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let cfg = fake_claude(&dir, "exit 0");
+        let mut sup = Supervisor::new(cfg);
+        let mut s = spec(&project, "ada");
+        s.worktree = true;
+        s.project = Some(project.clone());
+        let err = sup.launch(s.clone()).unwrap_err();
+        assert!(err.contains("not a git repository"), "{err}");
+        assert_eq!(
+            sup.launch_record("ada").unwrap().diag.unwrap().cause,
+            Cause::WorktreeNotReady
+        );
+        // A member without a worktree launches normally.
+        let mut plain = spec(&project, "bob");
+        plain.worktree = false;
+        sup.launch(plain).unwrap();
+        diagnostics::init_repo(&project).unwrap();
+        assert!(sup.launch(s.clone()).unwrap_err().contains("no commit"));
+        std::fs::write(project.join("f"), "x").unwrap();
+        diagnostics::initial_commit(&project).unwrap();
+        sup.launch(s).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

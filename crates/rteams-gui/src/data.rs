@@ -43,6 +43,11 @@ impl Data {
         Ok(changed)
     }
 
+    /// The team's directory (`<home>/<team>`), for per-team sidecar files.
+    pub fn dir(&self) -> &std::path::Path {
+        self.store.dir()
+    }
+
     /// Seq of the newest event loaded (0 for an empty log).
     pub fn seq(&self) -> u64 {
         self.store.loaded_events().last().map_or(0, |e| e.seq)
@@ -175,7 +180,10 @@ fn event_task(k: &EventKind) -> Option<&str> {
         | TaskClarificationSet { task, .. }
         | TaskFileAttached { task, .. }
         | TasksLinked { task, .. }
-        | ReviewStarted { task } => Some(task),
+        | ReviewStarted { task }
+        | ReviewerAdded { task, .. }
+        | ReviewerRemoved { task, .. }
+        | TaskColumnSet { task, .. } => Some(task),
         TeamCreated { .. }
         | MemberAdded { .. }
         | MessageSent { .. }
@@ -186,11 +194,19 @@ fn event_task(k: &EventKind) -> Option<&str> {
         | ProcessStopped { .. }
         | ColumnOrderSet { .. }
         | TeamDeleted { .. }
+        | TeamRenamed { .. }
         | MessageReacted { .. }
         | ScheduleSet { .. }
         | ScheduleRemoved { .. }
         | PermissionRequested { .. }
-        | PermissionDecided { .. } => None,
+        | PermissionDecided { .. }
+        | GroupChatCreated { .. }
+        | GroupChatUpdated { .. }
+        | GroupChatDeleted { .. }
+        | ColumnCleared { .. }
+        | MemberHeartbeat { .. }
+        | LaunchRequested { .. }
+        | StopRequested { .. } => None,
     }
 }
 
@@ -247,12 +263,17 @@ fn summarize(k: &EventKind) -> String {
             task,
             archived: false,
         } => format!("restored {task}"),
-        TaskCommented { task, text } => format!("commented on {task}: {}", clip(text)),
+        TaskCommented { task, text, .. } => format!("commented on {task}: {}", clip(text)),
         ReviewRequested { task, reviewer } => format!("requested review of {task} from {reviewer}"),
         ReviewApproved { task, .. } => format!("approved {task}"),
         ReviewChangesRequested { task, comment } => {
             format!("requested changes on {task}: {}", clip(comment))
         }
+        MessageSent {
+            chat: Some(chat),
+            text,
+            ..
+        } => format!("posted in group {chat}: {}", clip(text)),
         MessageSent {
             to: Some(to), text, ..
         } => format!("messaged {to}: {}", clip(text)),
@@ -273,6 +294,7 @@ fn summarize(k: &EventKind) -> String {
         TasksLinked { task, related, .. } => format!("unlinked {task} from {related}"),
         ReviewStarted { task } => format!("started reviewing {task}"),
         ColumnOrderSet { column, .. } => format!("reordered the {column} column"),
+        TeamRenamed { name } => format!("renamed the team to {name}"),
         TeamDeleted { deleted: true } => "deleted the team".to_string(),
         TeamDeleted { .. } => "restored the team".to_string(),
         MessageReacted { emoji, .. } => format!("reacted {emoji}"),
@@ -282,6 +304,32 @@ fn summarize(k: &EventKind) -> String {
         PermissionDecided { id, allow, .. } => {
             format!("{} request {id}", if *allow { "allowed" } else { "denied" })
         }
+        GroupChatCreated { name, .. } => format!("created group chat {name}"),
+        GroupChatUpdated { id, .. } => format!("updated group chat {id}"),
+        GroupChatDeleted { id } => format!("deleted group chat {id}"),
+        ReviewerAdded { task, reviewer } => format!("added reviewer {reviewer} to {task}"),
+        ReviewerRemoved { task, reviewer } => format!("removed reviewer {reviewer} from {task}"),
+        TaskColumnSet { task, from, to } => {
+            format!(
+                "moved {task}: {} -> {}",
+                status_label(*from),
+                status_label(*to)
+            )
+        }
+        ColumnCleared { column, tasks } => {
+            format!("cleared {} task(s) from the {column} column", tasks.len())
+        }
+        MemberHeartbeat { member, status, .. } => format!("{member} is {status}"),
+        LaunchRequested { members } => format!("requested launch of {}", list_or_all(members)),
+        StopRequested { members } => format!("requested stop of {}", list_or_all(members)),
+    }
+}
+
+fn list_or_all(members: &[String]) -> String {
+    if members.is_empty() {
+        "everyone".to_string()
+    } else {
+        members.join(", ")
     }
 }
 
@@ -382,6 +430,7 @@ mod tests {
             Command::Comment {
                 task: "T1".into(),
                 text: "hello\nworld".into(),
+                attachments: vec![],
             },
         )
         .unwrap();

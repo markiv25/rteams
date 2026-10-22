@@ -371,6 +371,263 @@ pub fn parse_members(s: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The roster as pretty JSON (removed members are left out).
+pub fn roster_json(members: &[rteams_core::Member]) -> String {
+    let rows: Vec<serde_json::Value> = members
+        .iter()
+        .filter(|m| !m.removed)
+        .map(|m| {
+            let mut o = serde_json::Map::new();
+            o.insert("name".into(), m.name.clone().into());
+            o.insert("role".into(), m.role.clone().into());
+            if let Some(p) = m.prompt.as_deref().filter(|p| !p.is_empty()) {
+                o.insert("prompt".into(), p.into());
+            }
+            if let Some(x) = m.model.as_deref().filter(|p| !p.is_empty()) {
+                o.insert("model".into(), x.into());
+            }
+            if let Some(x) = m.runtime.as_deref().filter(|p| !p.is_empty()) {
+                o.insert("runtime".into(), x.into());
+            }
+            if m.worktree {
+                o.insert("worktree".into(), true.into());
+            }
+            if !m.mcp_allow.is_empty() {
+                o.insert("mcp_allow".into(), m.mcp_allow.clone().into());
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
+}
+
+/// Why a roster JSON could not be applied; the message is an i18n key plus an argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterError {
+    pub key: &'static str,
+    pub arg: String,
+}
+
+fn rerr(key: &'static str, arg: impl Into<String>) -> RosterError {
+    RosterError {
+        key,
+        arg: arg.into(),
+    }
+}
+
+/// Validates `text` against the current roster and returns the member commands that turn the
+/// roster into it: add new names, update changed fields, remove names that are gone (the
+/// `lead` is never removed) and restore names that were removed earlier.
+pub fn plan_roster(
+    existing: &[rteams_core::Member],
+    lead: Option<&str>,
+    text: &str,
+) -> Result<Vec<GuiCmd>, RosterError> {
+    let v: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| rerr("rteams.membersJson.invalid", e.to_string()))?;
+    let rows = v
+        .as_array()
+        .ok_or_else(|| rerr("rteams.membersJson.notArray", ""))?;
+    let str_of = |o: &serde_json::Value, k: &str| -> Option<String> {
+        o.get(k)
+            .and_then(|x| x.as_str())
+            .map(|x| x.trim().to_string())
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut cmds = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let at = format!("#{}", i + 1);
+        if !row.is_object() {
+            return Err(rerr("rteams.membersJson.notObject", at));
+        }
+        let name = str_of(row, "name").unwrap_or_default();
+        if !valid_member_name(&name) {
+            return Err(rerr("rteams.membersJson.badName", at));
+        }
+        if seen.contains(&name) {
+            return Err(rerr("team.members.editor.memberNamesUnique", name));
+        }
+        let role = str_of(row, "role").filter(|r| !r.is_empty());
+        let old = existing.iter().find(|m| m.name == name);
+        let prompt = str_of(row, "prompt");
+        let model = str_of(row, "model");
+        let runtime = str_of(row, "runtime");
+        let worktree = row.get("worktree").and_then(|x| x.as_bool());
+        let mcp: Option<Vec<String>> = row.get("mcp_allow").and_then(|x| x.as_array()).map(|a| {
+            let mut v: Vec<String> = a
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        });
+        match old {
+            None => {
+                cmds.push(GuiCmd::AddMember {
+                    name: name.clone(),
+                    role: role.clone().unwrap_or_else(|| "member".into()),
+                });
+                if prompt.as_deref().is_some_and(|p| !p.is_empty())
+                    || model.as_deref().is_some_and(|m| !m.is_empty())
+                {
+                    cmds.push(GuiCmd::UpdateMember {
+                        name: name.clone(),
+                        role: None,
+                        prompt: prompt.filter(|p| !p.is_empty()),
+                        model: model.filter(|m| !m.is_empty()),
+                        icon: None,
+                    });
+                }
+                if runtime.as_deref().is_some_and(|r| !r.is_empty()) || worktree == Some(true) {
+                    cmds.push(GuiCmd::SetMemberRuntime {
+                        name: name.clone(),
+                        runtime: runtime.filter(|r| !r.is_empty()),
+                        worktree: worktree.filter(|w| *w),
+                    });
+                }
+                if let Some(allow) = mcp.filter(|a| !a.is_empty()) {
+                    cmds.push(GuiCmd::SetMemberMcp {
+                        name: name.clone(),
+                        allow,
+                    });
+                }
+            }
+            Some(m) => {
+                if m.removed {
+                    cmds.push(GuiCmd::RemoveMember {
+                        name: name.clone(),
+                        removed: false,
+                    });
+                }
+                let role = role.filter(|r| *r != m.role);
+                let prompt =
+                    prompt.filter(|p| p.as_str() != m.prompt.as_deref().unwrap_or("").trim());
+                let model = model.filter(|x| x.as_str() != m.model.as_deref().unwrap_or(""));
+                if role.is_some() || prompt.is_some() || model.is_some() {
+                    cmds.push(GuiCmd::UpdateMember {
+                        name: name.clone(),
+                        role,
+                        prompt,
+                        model,
+                        icon: None,
+                    });
+                }
+                let runtime = runtime.filter(|r| Some(r.as_str()) != m.runtime.as_deref());
+                let worktree = worktree.filter(|w| *w != m.worktree);
+                if runtime.is_some() || worktree.is_some() {
+                    cmds.push(GuiCmd::SetMemberRuntime {
+                        name: name.clone(),
+                        runtime,
+                        worktree,
+                    });
+                }
+                if let Some(allow) = mcp.filter(|a| *a != m.mcp_allow) {
+                    cmds.push(GuiCmd::SetMemberMcp {
+                        name: name.clone(),
+                        allow,
+                    });
+                }
+            }
+        }
+        seen.push(name);
+    }
+    for m in existing.iter().filter(|m| !m.removed) {
+        if !seen.contains(&m.name) {
+            if Some(m.name.as_str()) == lead {
+                return Err(rerr("rteams.membersJson.keepLead", m.name.clone()));
+            }
+            cmds.push(GuiCmd::RemoveMember {
+                name: m.name.clone(),
+                removed: true,
+            });
+        }
+    }
+    Ok(cmds)
+}
+
+/// Draft of the members JSON editor, kept in egui memory.
+#[derive(Debug, Clone, Default)]
+struct JsonDraft {
+    open: bool,
+    text: String,
+    /// Roster text the draft was loaded from; a roster change reloads an untouched draft.
+    base: String,
+}
+
+/// "Edit as JSON" editor for the roster: validates as you type and applies the diff as member
+/// commands. Draws a toggle button, and the editor while it is open.
+pub fn members_json_editor(ui: &mut egui::Ui, v: &crate::view::View, out: &mut Intents) {
+    let id = egui::Id::unique("members-json-editor");
+    let mut st: JsonDraft = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    let tr = v.tr;
+    let roster = roster_json(v.members());
+    let label = if st.open {
+        tr.t("team.dialogs.membersJson.hide")
+    } else {
+        tr.t("team.members.editor.editAsJson")
+    };
+    if theme::ghost(ui, &label).clicked() {
+        st.open = !st.open;
+        st.text = roster.clone();
+        st.base = roster.clone();
+    }
+    if st.open {
+        if st.text == st.base && st.base != roster {
+            st.text = roster.clone();
+            st.base = roster.clone();
+        }
+        ui.add(
+            egui::TextEdit::multiline(&mut st.text)
+                .code_editor()
+                .desired_rows(8)
+                .desired_width(f32::INFINITY),
+        );
+        let plan = plan_roster(v.members(), v.actor, &st.text);
+        match &plan {
+            Err(e) => {
+                let text = if e.arg.is_empty() {
+                    tr.t(e.key)
+                } else {
+                    format!("{} ({})", tr.t(e.key), e.arg)
+                };
+                ui.label(RichText::new(text).color(theme::ERROR));
+            }
+            Ok(cmds) => {
+                ui.label(
+                    RichText::new(tr.t_args(
+                        "rteams.membersJson.changes",
+                        &[("n", &cmds.len().to_string())],
+                    ))
+                    .color(theme::MUTED),
+                );
+            }
+        }
+        ui.horizontal(|ui| {
+            let ok = v.actor.is_some() && plan.as_ref().is_ok_and(|c| !c.is_empty());
+            if ui
+                .add_enabled_ui(ok, |ui| {
+                    theme::solid(ui, &tr.t("rteams.membersJson.apply"), theme::INFO)
+                })
+                .inner
+                .clicked()
+            {
+                if let Ok(cmds) = plan {
+                    for c in cmds {
+                        out.push(Intent::Run(c));
+                    }
+                    st.base.clear();
+                }
+            }
+            if ui.button(tr.t("rteams.membersJson.reset")).clicked() {
+                st.text = roster;
+            }
+        });
+    }
+    ui.data_mut(|d| d.insert_temp(id, st));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +671,106 @@ mod tests {
                 ("bob".to_string(), "member".to_string())
             ]
         );
+    }
+
+    fn mem(name: &str, role: &str) -> rteams_core::Member {
+        serde_json::from_value(serde_json::json!({"name": name, "role": role})).unwrap()
+    }
+
+    #[test]
+    fn roster_json_round_trips_to_no_changes() {
+        let mut ada = mem("ada", "dev");
+        ada.model = Some("opus".into());
+        ada.worktree = true;
+        let mut gone = mem("old", "dev");
+        gone.removed = true;
+        let roster = vec![mem("boss", "lead"), ada, gone];
+        let text = roster_json(&roster);
+        assert!(!text.contains("old"));
+        assert_eq!(plan_roster(&roster, Some("boss"), &text).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn roster_plan_add_update_remove_restore() {
+        let mut old = mem("old", "dev");
+        old.removed = true;
+        let roster = vec![
+            mem("boss", "lead"),
+            mem("ada", "dev"),
+            mem("bob", "dev"),
+            old,
+        ];
+        let text = r#"[
+            {"name":"boss","role":"lead"},
+            {"name":"ada","role":"reviewer","model":"opus"},
+            {"name":"cy","role":"qa","prompt":"test it","worktree":true},
+            {"name":"old","role":"dev"}
+        ]"#;
+        let cmds = plan_roster(&roster, Some("boss"), text).unwrap();
+        assert!(cmds.contains(&GuiCmd::UpdateMember {
+            name: "ada".into(),
+            role: Some("reviewer".into()),
+            prompt: None,
+            model: Some("opus".into()),
+            icon: None,
+        }));
+        assert!(cmds.contains(&GuiCmd::AddMember {
+            name: "cy".into(),
+            role: "qa".into()
+        }));
+        assert!(cmds.contains(&GuiCmd::SetMemberRuntime {
+            name: "cy".into(),
+            runtime: None,
+            worktree: Some(true)
+        }));
+        assert!(cmds.contains(&GuiCmd::RemoveMember {
+            name: "bob".into(),
+            removed: true
+        }));
+        assert!(cmds.contains(&GuiCmd::RemoveMember {
+            name: "old".into(),
+            removed: false
+        }));
+    }
+
+    #[test]
+    fn roster_validation_errors() {
+        let roster = vec![mem("boss", "lead"), mem("ada", "dev")];
+        let key = |t: &str| plan_roster(&roster, Some("boss"), t).unwrap_err().key;
+        assert_eq!(key("{"), "rteams.membersJson.invalid");
+        assert_eq!(key("{}"), "rteams.membersJson.notArray");
+        assert_eq!(key("[1]"), "rteams.membersJson.notObject");
+        assert_eq!(key(r#"[{"name":"a b"}]"#), "rteams.membersJson.badName");
+        assert_eq!(
+            key(r#"[{"name":"boss"},{"name":"boss"}]"#),
+            "team.members.editor.memberNamesUnique"
+        );
+        assert_eq!(key(r#"[{"name":"ada"}]"#), "rteams.membersJson.keepLead");
+    }
+
+    #[test]
+    fn json_editor_renders() {
+        let (home, data) = crate::view::testing::fixture("membersjson");
+        let view = crate::view::View {
+            state: data.state(),
+            data: &data,
+            actor: Some("boss"),
+            agents: &[],
+            tr: crate::view::testing::tr(),
+        };
+        crate::view::testing::render(|ui| {
+            ui.data_mut(|d| {
+                d.insert_temp(
+                    egui::Id::unique("members-json-editor"),
+                    JsonDraft {
+                        open: true,
+                        text: "[".into(),
+                        base: "[".into(),
+                    },
+                )
+            });
+            members_json_editor(ui, &view, &mut Intents::default());
+        });
+        let _ = std::fs::remove_dir_all(home);
     }
 }

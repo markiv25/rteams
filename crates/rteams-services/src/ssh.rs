@@ -203,10 +203,8 @@ pub fn list_remote_dir(p: &SshProfile, dir: &str) -> Result<Vec<String>, String>
 pub fn parse_config_hosts(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
-        let line = line.trim();
-        let mut it = line.splitn(2, char::is_whitespace);
-        if it.next().is_some_and(|k| k.eq_ignore_ascii_case("host")) {
-            for h in it.next().unwrap_or("").split_whitespace() {
+        if let Some(("host", rest)) = split_directive(line).as_ref().map(|(k, v)| (&**k, v)) {
+            for h in rest.split_whitespace() {
                 if !h.contains(['*', '?', '!']) && !out.iter().any(|x| x == h) {
                     out.push(h.to_string());
                 }
@@ -214,6 +212,222 @@ pub fn parse_config_hosts(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `Key value` or `Key=value` -> (lowercased key, value). Comments and blanks give None.
+fn split_directive(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let i = line.find(|c: char| c.is_whitespace() || c == '=')?;
+    let key = line[..i].to_ascii_lowercase();
+    let val = line[i..].trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+    let val = val.trim().trim_matches('"');
+    Some((key, val.to_string()))
+}
+
+/// One `Host` section of an ssh config (all of its patterns share the settings).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostSection {
+    pub patterns: Vec<String>,
+    pub host_name: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub identity_file: Option<String>,
+}
+
+/// What `ssh <alias>` would use, merged from every matching section (first value wins).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedHost {
+    pub alias: String,
+    pub host_name: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub identity_file: Option<String>,
+}
+
+/// Split config text into `Host` sections (settings before the first `Host` are ignored).
+pub fn parse_sections(text: &str) -> Vec<HostSection> {
+    let mut out: Vec<HostSection> = Vec::new();
+    for line in text.lines() {
+        let Some((k, v)) = split_directive(line) else {
+            continue;
+        };
+        if k == "host" {
+            out.push(HostSection {
+                patterns: v.split_whitespace().map(str::to_string).collect(),
+                ..Default::default()
+            });
+            continue;
+        }
+        if k == "match" {
+            // Match blocks are not evaluated; keep their settings out of Host sections.
+            out.push(HostSection::default());
+            continue;
+        }
+        let Some(sec) = out.last_mut() else { continue };
+        match k.as_str() {
+            "hostname" => sec.host_name.get_or_insert(v),
+            "user" => sec.user.get_or_insert(v),
+            "identityfile" => sec.identity_file.get_or_insert(v),
+            "port" => {
+                if sec.port.is_none() {
+                    sec.port = v.parse().ok();
+                }
+                continue;
+            }
+            _ => continue,
+        };
+    }
+    out
+}
+
+/// Glob match with `*` and `?`.
+fn glob(pat: &str, s: &str) -> bool {
+    let (p, s): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
+    fn go(p: &[char], s: &[char]) -> bool {
+        match p.split_first() {
+            None => s.is_empty(),
+            Some(('*', rest)) => (0..=s.len()).any(|i| go(rest, &s[i..])),
+            Some(('?', rest)) => !s.is_empty() && go(rest, &s[1..]),
+            Some((c, rest)) => s.first() == Some(c) && go(rest, &s[1..]),
+        }
+    }
+    go(&p, &s)
+}
+
+fn section_matches(sec: &HostSection, alias: &str) -> bool {
+    let mut hit = false;
+    for p in &sec.patterns {
+        if let Some(neg) = p.strip_prefix('!') {
+            if glob(neg, alias) {
+                return false;
+            }
+        } else if glob(p, alias) {
+            hit = true;
+        }
+    }
+    hit
+}
+
+/// Resolve `alias`. None when no section names it explicitly (a lone `Host *` does not make an
+/// unknown alias "known").
+pub fn resolve_host(text: &str, alias: &str) -> Option<ResolvedHost> {
+    let secs = parse_sections(text);
+    let matching: Vec<&HostSection> = secs.iter().filter(|s| section_matches(s, alias)).collect();
+    let explicit = matching
+        .iter()
+        .any(|s| s.patterns.iter().any(|p| p == alias));
+    if !explicit {
+        return None;
+    }
+    let mut r = ResolvedHost {
+        alias: alias.to_string(),
+        ..Default::default()
+    };
+    for s in matching {
+        r.host_name = r.host_name.or_else(|| s.host_name.clone());
+        r.user = r.user.or_else(|| s.user.clone());
+        r.port = r.port.or(s.port);
+        r.identity_file = r.identity_file.or_else(|| s.identity_file.clone());
+    }
+    Some(r)
+}
+
+const MAX_INCLUDE_DEPTH: u8 = 4;
+
+/// Read an ssh config file, expanding `Include` lines in place (relative paths resolve against
+/// `ssh_dir`, `~/` against `user_home`; `*`/`?` allowed in the last path segment). Depth-limited.
+pub fn read_config_expanded(path: &Path, ssh_dir: &Path, user_home: &Path) -> String {
+    expand(path, ssh_dir, user_home, 0)
+}
+
+fn expand(path: &Path, ssh_dir: &Path, user_home: &Path, depth: u8) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for line in text.lines() {
+        match split_directive(line) {
+            Some((k, v)) if k == "include" && depth < MAX_INCLUDE_DEPTH => {
+                for spec in v.split_whitespace() {
+                    for f in include_files(spec, ssh_dir, user_home) {
+                        out.push_str(&expand(&f, ssh_dir, user_home, depth + 1));
+                        out.push('\n');
+                    }
+                }
+            }
+            Some((k, _)) if k == "include" => {}
+            _ => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn include_files(spec: &str, ssh_dir: &Path, user_home: &Path) -> Vec<PathBuf> {
+    let full = if let Some(rest) = spec.strip_prefix("~/") {
+        user_home.join(rest)
+    } else if Path::new(spec).is_absolute() {
+        PathBuf::from(spec)
+    } else {
+        ssh_dir.join(spec)
+    };
+    let (Some(dir), Some(name)) = (full.parent(), full.file_name().and_then(|n| n.to_str())) else {
+        return vec![];
+    };
+    if !name.contains(['*', '?']) {
+        return vec![full];
+    }
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| glob(name, n)))
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Full text of `<user_home>/.ssh/config` with includes expanded ("" when absent).
+pub fn load_user_config(user_home: &Path) -> String {
+    let dir = user_home.join(".ssh");
+    read_config_expanded(&dir.join("config"), &dir, user_home)
+}
+
+/// A profile that defers to the ssh config for `alias` (auth `Auto`), pre-filled from it.
+pub fn profile_from_host(r: &ResolvedHost) -> SshProfile {
+    SshProfile {
+        id: String::new(),
+        name: r.alias.clone(),
+        host: r.alias.clone(),
+        port: r.port.unwrap_or(22),
+        user: r.user.clone().unwrap_or_default(),
+        auth: Auth::Auto,
+        key_path: r.identity_file.clone().unwrap_or_default(),
+    }
+}
+
+// ---- last connection: <home>/ssh-last.json ----
+
+pub fn save_last_connection(home: &Path, profile_id: &str) -> std::io::Result<()> {
+    atomic::write_json(
+        &home.join("ssh-last.json"),
+        &serde_json::json!({ "profile_id": profile_id }),
+    )
+}
+
+pub fn load_last_connection(home: &Path) -> Option<String> {
+    atomic::read_json(&home.join("ssh-last.json"))?
+        .get("profile_id")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -285,5 +499,80 @@ mod tests {
     fn config_host_parser() {
         let t = "Host *\n  User x\nHost dev  prod-*  staging\nhost Dev\n";
         assert_eq!(parse_config_hosts(t), vec!["dev", "staging", "Dev"]);
+    }
+
+    const CFG: &str = "Host *\n  User fallback\n  Port 2200\nHost web db\n  HostName 10.0.0.5\n  IdentityFile ~/.ssh/id_web\nHost web\n  User deploy\n  Port=2022\nHost prod-*\n  User ops\nHost *.corp !bad.corp\n  User corp\n";
+
+    #[test]
+    fn multiple_hosts_per_line_and_wildcards() {
+        assert_eq!(parse_config_hosts(CFG), vec!["web", "db"]);
+        let web = resolve_host(CFG, "web").unwrap();
+        assert_eq!(web.host_name.as_deref(), Some("10.0.0.5"));
+        assert_eq!(web.user.as_deref(), Some("fallback"));
+        assert_eq!(web.port, Some(2200));
+        assert_eq!(web.identity_file.as_deref(), Some("~/.ssh/id_web"));
+        let db = resolve_host(CFG, "db").unwrap();
+        assert_eq!(db.host_name.as_deref(), Some("10.0.0.5"));
+        assert_eq!(db.port, Some(2200));
+    }
+
+    #[test]
+    fn resolve_requires_explicit_host_and_honors_negation() {
+        assert!(resolve_host(CFG, "prod-1").is_none());
+        assert!(resolve_host(CFG, "nope").is_none());
+        assert!(resolve_host("Host *.corp !bad.corp\n User c\n", "a.corp").is_none());
+        let t = "Host a.corp bad.corp\n User x\nHost *.corp !bad.corp\n User c\n";
+        assert_eq!(
+            resolve_host(t, "a.corp").unwrap().user.as_deref(),
+            Some("x")
+        );
+        assert!(section_matches(
+            &parse_sections("Host *.corp !bad.corp")[0],
+            "a.corp"
+        ));
+        assert!(!section_matches(
+            &parse_sections("Host *.corp !bad.corp")[0],
+            "bad.corp"
+        ));
+    }
+
+    #[test]
+    fn include_expands_relative_glob_and_tilde_without_loops() {
+        let d = tempfile::tempdir().unwrap();
+        let ssh = d.path().join(".ssh");
+        std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        std::fs::write(
+            ssh.join("config"),
+            "Include conf.d/*.conf\nInclude ~/.ssh/extra\nInclude config\nHost main\n HostName m.example\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh.join("conf.d/a.conf"),
+            "Host alpha\n  User al\n  Port 99\n",
+        )
+        .unwrap();
+        std::fs::write(ssh.join("conf.d/b.txt"), "Host skipped\n").unwrap();
+        std::fs::write(ssh.join("extra"), "Host beta\n  HostName b.example\n").unwrap();
+        let text = load_user_config(d.path());
+        assert_eq!(parse_config_hosts(&text), vec!["alpha", "beta", "main"]);
+        let a = resolve_host(&text, "alpha").unwrap();
+        assert_eq!((a.user.as_deref(), a.port), (Some("al"), Some(99)));
+        assert_eq!(load_user_config(&d.path().join("missing")), "");
+    }
+
+    #[test]
+    fn profile_from_resolved_defers_to_config() {
+        let r = resolve_host(CFG, "web").unwrap();
+        let p = profile_from_host(&r);
+        assert_eq!((p.host.as_str(), p.port, p.auth), ("web", 2200, Auth::Auto));
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn last_connection_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(load_last_connection(d.path()), None);
+        save_last_connection(d.path(), "abc").unwrap();
+        assert_eq!(load_last_connection(d.path()).as_deref(), Some("abc"));
     }
 }

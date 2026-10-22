@@ -158,6 +158,61 @@ impl AgentRuntime for Codex {
                 toml_table(&ctx.mcp_env)
             ));
         }
+        for (name, e) in ctx.extra_mcp.iter().filter(|(n, _)| n != "rteams") {
+            if !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            {
+                continue;
+            }
+            if let Some(url) = e["url"].as_str() {
+                c.arg("-c")
+                    .arg(format!("mcp_servers.{name}.url={}", toml_str(url)));
+                continue;
+            }
+            let Some(cmd) = e["command"].as_str() else {
+                continue;
+            };
+            c.arg("-c")
+                .arg(format!("mcp_servers.{name}.command={}", toml_str(cmd)));
+            let args: Vec<String> = e["args"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            c.arg("-c")
+                .arg(format!("mcp_servers.{name}.args={}", toml_array(&args)));
+            let env: Vec<(String, String)> = e["env"]
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !env.is_empty() {
+                c.arg("-c")
+                    .arg(format!("mcp_servers.{name}.env={}", toml_table(&env)));
+            }
+        }
+        if let Some(e) = ctx
+            .effort
+            .as_deref()
+            .filter(|e| matches!(*e, "low" | "medium" | "high" | "xhigh"))
+        {
+            c.arg("-c")
+                .arg(format!("model_reasoning_effort={}", toml_str(e)));
+        }
+        if ctx.fast {
+            c.arg("-c")
+                .arg(format!("service_tier={}", toml_str("fast")));
+        }
+        if let Some(n) = ctx.context_limit {
+            c.arg("-c").arg(format!("model_context_window={n}"));
+        }
         c.arg(prompt_with_system(ctx));
         c
     }
@@ -245,6 +300,9 @@ impl AgentRuntime for Codex {
         (v["type"].as_str() == Some("thread.started"))
             .then(|| v["thread_id"].as_str().map(str::to_string))
             .flatten()
+    }
+    fn login_command(&self) -> Option<&'static str> {
+        Some("codex login")
     }
     fn supports_resume(&self) -> bool {
         true

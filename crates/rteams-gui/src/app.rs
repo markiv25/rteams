@@ -28,19 +28,25 @@ use crate::task_dialog::{CreateTaskDialog, TaskDialog};
 use crate::team;
 use crate::teams::Teams;
 use crate::theme;
+use crate::ui::activity;
 use crate::ui::close_guard::{CloseDecision, CloseGuard, StaticBlockers};
 use crate::ui::dashboard::Dashboard;
 use crate::ui::editor::EditorScreen;
 use crate::ui::ext::store_tabs::ExtensionsScreen;
 use crate::ui::graph::GraphScreen;
+use crate::ui::launch_dialog::{LaunchDialog, LaunchOptions};
 use crate::ui::log_stream::LogStream;
 use crate::ui::news_button::NewsButton;
+use crate::ui::onboarding::Onboarding;
 use crate::ui::orgs::map_tab::OrgMapScreen;
+use crate::ui::palette::{self, Palette};
 use crate::ui::queue_list::QueueList;
 use crate::ui::schedules::Schedules;
 use crate::ui::sessions::SessionsScreen;
+use crate::ui::settings::permissions::ToolApproval;
 use crate::ui::settings::SettingsScreen;
 use crate::ui::task_folders::TaskFoldersPanel;
+use crate::ui::task_sidebar::TaskSidebar;
 use crate::ui::terminal::TerminalDrawer;
 use crate::ui::tmux_banner::TmuxBanner;
 use crate::ui::update_banner::UpdateBanner;
@@ -131,6 +137,8 @@ pub struct App {
     tmux: TmuxBanner,
     guard: CloseGuard,
     update: UpdateBanner,
+    /// First-run setup wizard (no teams yet).
+    onboarding: Onboarding,
     news: NewsButton,
     /// Local HTTP API, running while Settings > Advanced enables it.
     http: Option<HttpHandle>,
@@ -153,6 +161,22 @@ pub struct App {
     /// Git branch of the project path, refreshed when settings open or git changes.
     branch: Option<String>,
     window_title: String,
+    /// Command palette / global search.
+    palette: Palette,
+    /// Palette candidates, rebuilt every couple of seconds while it is open.
+    pal_items: Vec<palette::Item>,
+    pal_acts: Vec<PAct>,
+    pal_built: Option<std::time::Instant>,
+    /// Global task sidebar (right).
+    task_sidebar: TaskSidebar,
+    /// Second pane (right) of the split view, with its own active tab.
+    split: Option<Tab>,
+    /// Launch dialog (member picker + options).
+    launch_dialog: LaunchDialog,
+    /// Options picked in the launch dialog, applied to the launches it starts.
+    launch_opts: Option<LaunchOptions>,
+    /// Log position up to which LaunchRequested / StopRequested events were handled.
+    launch_cursor: u64,
 }
 
 /// Message mode string -> launcher mode (unknown or none = do).
@@ -190,23 +214,38 @@ fn gui_state_path(home: &Path, team: &str) -> PathBuf {
 }
 
 /// Saved permission choice for `team` (`skip` when unset).
-fn load_perm(home: &Path, team: &str) -> String {
+fn load_gui_key(home: &Path, team: &str, key: &str) -> Option<String> {
     std::fs::read_to_string(gui_state_path(home, team))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v["permissions"].as_str().map(String::from))
-        .unwrap_or_else(|| "skip".into())
+        .and_then(|v| v[key].as_str().map(String::from))
+}
+
+fn load_perm(home: &Path, team: &str) -> String {
+    load_gui_key(home, team, "permissions")
+        // No per-team choice yet: Settings > Permissions (app-wide; default skip).
+        .unwrap_or_else(|| ToolApproval::from_extra(&AppConfig::load(home).extra).default)
 }
 
 /// Save the permission choice, keeping the file's other keys. Best effort.
 fn save_perm(home: &Path, team: &str, perm: &str) {
+    save_gui_key(home, team, "permissions", perm);
+}
+
+/// The team's saved extra CLI flags (raw text); empty when none.
+fn load_extra_args(home: &Path, team: &str) -> String {
+    load_gui_key(home, team, "extra_cli_args").unwrap_or_default()
+}
+
+/// Set one string key in the team's GUI state file, keeping the other keys. Best effort.
+fn save_gui_key(home: &Path, team: &str, key: &str, value: &str) {
     let path = gui_state_path(home, team);
     let mut v = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
-    v["permissions"] = serde_json::Value::String(perm.into());
+    v[key] = serde_json::Value::String(value.into());
     let _ = std::fs::write(path, v.to_string());
 }
 
@@ -217,7 +256,7 @@ fn now_ms() -> i64 {
 }
 
 /// Top-level tabs, as in the original's tab bar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Tab {
     Dashboard,
     Team,
@@ -233,7 +272,60 @@ enum Tab {
     Providers,
 }
 
+/// What a palette row does when picked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PAct {
+    OpenTab(Tab),
+    NewTask,
+    NewTeam,
+    LaunchAll,
+    StopAll,
+    ToggleTaskSidebar,
+    ToggleSplit,
+    SwitchTeam(String),
+    Task(String),
+    Member(String),
+    Chat(Option<String>),
+    Logs,
+}
+
+/// Right-click menu choices of a tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabAct {
+    Close,
+    CloseOthers,
+    CloseRight,
+    MoveToPane,
+    CloseSplit,
+}
+
+/// Move `item` so it sits before the element at `slot` (0..=len, counted before the move).
+fn move_to_slot<T: PartialEq + Copy>(v: &mut Vec<T>, item: T, slot: usize) {
+    let Some(from) = v.iter().position(|x| *x == item) else {
+        return;
+    };
+    v.remove(from);
+    let at = if slot > from { slot - 1 } else { slot };
+    v.insert(at.min(v.len()), item);
+}
+
 impl Tab {
+    /// Tabs that can show in the split pane: screens drawn by `phase2`.
+    fn splittable(self) -> bool {
+        matches!(
+            self,
+            Tab::Dashboard
+                | Tab::Usage
+                | Tab::Editor
+                | Tab::Graph
+                | Tab::Extensions
+                | Tab::Schedules
+                | Tab::OrgMap
+                | Tab::Sessions
+                | Tab::Settings
+        )
+    }
+
     /// On-demand tabs the user can close; Dashboard, the team and Teams are always there.
     fn closable(self) -> bool {
         !matches!(self, Tab::Dashboard | Tab::Team | Tab::Teams)
@@ -291,6 +383,7 @@ impl App {
         let config = AppConfig::load(&home);
         let home_for_screens = home.clone();
         apikeys::init_home(&home);
+        crate::provider_cfg::set_home(&home);
         history::interrupt_stale(&home, &team, now_ms());
         let workdir = std::env::current_dir()
             .map(|d| d.display().to_string())
@@ -345,6 +438,7 @@ impl App {
             tmux: TmuxBanner::default(),
             guard: CloseGuard::default(),
             update: UpdateBanner::default(),
+            onboarding: Onboarding::default(),
             news: NewsButton::default(),
             http: None,
             last_automation: 0,
@@ -358,9 +452,21 @@ impl App {
             center: NotificationCenter::default(),
             perm: "skip".into(),
             branch: None,
+            palette: Palette::default(),
+            pal_items: Vec::new(),
+            pal_acts: Vec::new(),
+            pal_built: None,
+            task_sidebar: TaskSidebar::default(),
+            split: None,
+            launch_dialog: LaunchDialog::default(),
+            launch_opts: None,
+            launch_cursor: 0,
         };
         app.try_open();
         app.sync_http();
+        if Onboarding::needed(&app.home) {
+            app.onboarding.start();
+        }
         app
     }
 
@@ -370,6 +476,7 @@ impl App {
                 // History before the GUI opened never wakes anyone.
                 self.wake = WakeScheduler::with_cursor(d.seq());
                 self.notified = d.seq();
+                self.launch_cursor = d.seq();
                 self.messages
                     .load_cursors(gui_state_path(&self.home, &self.team));
                 self.messages.set_home(self.home.clone(), self.team.clone());
@@ -380,6 +487,7 @@ impl App {
                 // Requests pending before the GUI opened show in the sheet, not as toasts.
                 self.approvals_seen = d.state().permissions.iter().map(|p| p.id.clone()).collect();
                 self.perm = load_perm(&self.home, &self.team);
+                self.launch_dialog.extra = load_extra_args(&self.home, &self.team);
                 self.supervisor.set_permissions(permissions_of(&self.perm));
                 self.data = Some(d);
                 self.sync_repo();
@@ -398,6 +506,7 @@ impl App {
     fn sync_repo(&mut self) {
         let repo = self.project();
         self.branch = repo.as_deref().and_then(git::current_branch);
+        self.member_dialog.set_repo(repo.clone());
         self.task_dialog
             .set_paths(self.home.clone(), self.team.clone(), repo);
     }
@@ -513,13 +622,60 @@ impl App {
             worktree: m.worktree,
             project: project.clone().map(PathBuf::from),
             solo: agents == 1,
-            env: apikeys::env_for_project(
-                &self.home,
+            env: {
+                let mut env = apikeys::env_for_project(
+                    &self.home,
+                    m.runtime
+                        .as_deref()
+                        .filter(|r| !r.is_empty())
+                        .unwrap_or("claude"),
+                    project.as_deref().map(Path::new),
+                );
+                // Approval timeout for `Ask me` mode (read by the rteams MCP server).
+                let ms = ToolApproval::from_extra(&self.config.extra).timeout_ms();
+                env.push(("RTEAMS_PERMISSION_TIMEOUT_MS".into(), ms.to_string()));
+                let rt = m
+                    .runtime
+                    .as_deref()
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or("claude");
+                if let Some(n) = crate::provider_cfg::max_output(
+                    &AppConfig::load(&self.home).extra,
+                    rt,
+                    m.model.as_deref(),
+                ) {
+                    env.push(("CLAUDE_CODE_MAX_OUTPUT_TOKENS".into(), n.to_string()));
+                }
+                env
+            },
+            effort: self
+                .launch_opts
+                .as_ref()
+                .map_or_else(|| m.effort.clone(), |o| o.effort.clone()),
+            fast: self.launch_opts.as_ref().map_or(m.fast, |o| o.fast),
+            context_limit: crate::provider_cfg::effective_context(
+                &AppConfig::load(&self.home).extra,
                 m.runtime
                     .as_deref()
                     .filter(|r| !r.is_empty())
                     .unwrap_or("claude"),
-                project.as_deref().map(Path::new),
+                m.model.as_deref(),
+                self.launch_opts
+                    .as_ref()
+                    .map_or(m.context_limit, |o| o.context_limit),
+            ),
+            permissions: self.launch_opts.as_ref().map(|o| o.permissions.clone()),
+            mcp_allow: m.mcp_allow.clone(),
+            // This launch's flags, else the team's saved ones (protected flags re-checked).
+            extra_args: self.launch_opts.as_ref().map_or_else(
+                || {
+                    crate::launcher::validate_extra_args(
+                        &load_extra_args(&self.home, &self.team),
+                        None,
+                    )
+                    .unwrap_or_default()
+                },
+                |o| o.extra_args.clone(),
             ),
             ..Default::default()
         };
@@ -532,6 +688,59 @@ impl App {
                 })
                 .map_err(|e| format!("{member}: {e}")),
         );
+    }
+
+    /// Members whose agent is running right now.
+    fn running_members(&self) -> Vec<String> {
+        self.supervisor
+            .agents()
+            .into_iter()
+            .filter(|a| matches!(a.status, AgentStatus::Running { .. }))
+            .map(|a| a.member)
+            .collect()
+    }
+
+    /// Start the launches the dialog confirmed, with its options.
+    fn launch_with_options(&mut self, o: LaunchOptions) {
+        let running = self.running_members();
+        save_gui_key(&self.home, &self.team, "extra_cli_args", &o.extra_raw);
+        self.launch_opts = Some(o.clone());
+        for m in o.members.iter().filter(|m| !running.contains(m)) {
+            self.launch(m);
+        }
+        self.launch_opts = None;
+    }
+
+    /// Launch / stop requests agents recorded in the log (`team_launch` / `team_stop`).
+    fn tick_launch_requests(&mut self) {
+        let Some(d) = &self.data else { return };
+        if d.seq() <= self.launch_cursor {
+            return;
+        }
+        let (mut launch, mut stop) = (Vec::new(), Vec::new());
+        for e in d.events().iter().filter(|e| e.seq > self.launch_cursor) {
+            match &e.kind {
+                rteams_core::EventKind::LaunchRequested { members } => {
+                    launch.extend(members.iter().cloned())
+                }
+                rteams_core::EventKind::StopRequested { members } => {
+                    stop.extend(members.iter().cloned())
+                }
+                _ => {}
+            }
+        }
+        self.launch_cursor = d.seq();
+        let all = self.agent_names();
+        let running = self.running_members();
+        for m in launch {
+            if all.contains(&m) && !running.contains(&m) {
+                self.launch(&m);
+            }
+        }
+        for m in stop {
+            recovery::cancel(&self.home, &self.team, &m);
+            self.supervisor.stop(&m);
+        }
     }
 
     /// Every roster member except the human.
@@ -657,7 +866,7 @@ impl App {
                     self.messages.open_chat(chat);
                     self.messages.set_full_screen(true);
                 }
-                Intent::Launch(m) => self.launch(&m),
+                Intent::Launch(m) => self.launch_dialog.open(&[m]),
                 Intent::Stop(m) => {
                     recovery::cancel(&self.home, &self.team, &m);
                     self.supervisor.stop(&m);
@@ -668,17 +877,14 @@ impl App {
                     }
                 }
                 Intent::LaunchAll => {
-                    let running: Vec<String> = self
-                        .supervisor
-                        .agents()
+                    let running = self.running_members();
+                    let names: Vec<String> = self
+                        .agent_names()
                         .into_iter()
-                        .filter(|a| matches!(a.status, AgentStatus::Running { .. }))
-                        .map(|a| a.member)
+                        .filter(|m| !running.contains(m))
                         .collect();
-                    for m in self.agent_names() {
-                        if !running.contains(&m) {
-                            self.launch(&m);
-                        }
+                    if !names.is_empty() {
+                        self.launch_dialog.open(&names);
                     }
                 }
                 Intent::StopAll => {
@@ -688,6 +894,7 @@ impl App {
                 }
                 Intent::SwitchTeam(team) => self.switch_team(team),
                 Intent::OpenApprovals => self.approvals.open(),
+                Intent::OpenProviders => self.tab = Tab::Providers,
                 Intent::OpenNotifications => self.center.open(),
                 Intent::CrossTeamSend { team, to, text } => {
                     let Some(actor) = actor else { continue };
@@ -768,18 +975,99 @@ impl App {
             self.sessions.tick(ctx, &mut c);
             self.terminal.show(ui, &mut c);
         }
-        let mine = matches!(
-            self.tab,
-            Tab::Dashboard
-                | Tab::Usage
-                | Tab::Editor
-                | Tab::Graph
-                | Tab::Extensions
-                | Tab::Schedules
-                | Tab::OrgMap
-                | Tab::Sessions
-                | Tab::Settings
-        );
+        let mine = self.tab.splittable();
+        let split = self.split.filter(|t| t.splittable());
+        let split_titles: Vec<(Tab, String)> = [Tab::Dashboard]
+            .into_iter()
+            .chain(self.open_tabs.iter().copied())
+            .filter(|t| t.splittable())
+            .map(|t| (t, self.tab_title(t, &self.team)))
+            .collect();
+        let split_title = split.map(|t| self.tab_title(t, &self.team));
+        let mut split_pick: Option<Tab> = None;
+        let mut split_close = false;
+        let tab_now = self.tab;
+        // Draws the screen of `tab` (one at a time per frame, so widget ids never clash).
+        let mut draw = |ui: &mut egui::Ui, tab: Tab, c: &mut FeatureCtx| {
+            if tab == Tab::from(self.dashboard.id()) {
+                self.update.show(ui, c);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.news.show(ui, c)
+                    });
+                });
+                self.tmux.show(ui, c);
+                self.dashboard.show(ui, c);
+            } else if tab == Tab::from(self.usage.id()) {
+                self.usage.show(ui, c);
+            } else if tab == Tab::from(self.editor.id()) {
+                self.editor.show(ui, c);
+            } else if tab == Tab::from(self.graph.id()) {
+                self.graph.show(ui, c);
+            } else if tab == Tab::from(self.ext.id()) {
+                self.ext.show(ui, c);
+            } else if tab == Tab::from(self.schedules.id()) {
+                self.schedules.show(ui, c);
+            } else if tab == Tab::from(self.org_map.id()) {
+                self.org_map.show(ui, c);
+            } else if tab == Tab::from(self.sessions.id()) {
+                self.sessions.show(ui, c);
+            } else if tab == Tab::from(self.settings_screen.id()) {
+                self.settings_screen.show(ui, c);
+            }
+        };
+        let screen_w = ui.available_width();
+        if let Some(st) = split {
+            egui::Panel::right("split_pane")
+                .default_size((screen_w * 0.45).clamp(280.0, 900.0))
+                .size_range(240.0..=(screen_w * 0.8).max(241.0))
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::SURFACE)
+                        .stroke(egui::Stroke::new(1.0, theme::hairline(0.1)))
+                        .inner_margin(egui::Margin::same(12)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let title = split_title.clone().unwrap_or_default();
+                        let btn = theme::pill_icon_button(ui, Some(st.icon()), &title, true);
+                        egui::Popup::menu(&btn).width(220.0).show(|ui| {
+                            for (t, label) in &split_titles {
+                                if theme::menu_item(ui, Some(t.icon()), label).clicked() {
+                                    split_pick = Some(*t);
+                                    ui.close();
+                                }
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::icon_button(
+                                ui,
+                                Icon::X,
+                                &self.i18n.t("rteams.shell.tab.closeSplit"),
+                            )
+                            .clicked()
+                            {
+                                split_close = true;
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("split_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut c = FeatureCtx {
+                                home: &self.home,
+                                team: Some(&self.team),
+                                view: view.as_ref(),
+                                out: &mut out,
+                                tr: &self.i18n,
+                                req: &mut req,
+                            };
+                            draw(ui, st, &mut c);
+                        });
+                });
+        }
         if mine {
             egui::CentralPanel::default()
                 .frame(
@@ -796,35 +1084,14 @@ impl App {
                         tr: &self.i18n,
                         req: &mut req,
                     };
-                    let tab = self.tab;
-                    if tab == Tab::from(self.dashboard.id()) {
-                        self.update.show(ui, &mut c);
-                        ui.horizontal(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| self.news.show(ui, &mut c),
-                            );
-                        });
-                        self.tmux.show(ui, &mut c);
-                        self.dashboard.show(ui, &mut c);
-                    } else if tab == Tab::from(self.usage.id()) {
-                        self.usage.show(ui, &mut c);
-                    } else if tab == Tab::from(self.editor.id()) {
-                        self.editor.show(ui, &mut c);
-                    } else if tab == Tab::from(self.graph.id()) {
-                        self.graph.show(ui, &mut c);
-                    } else if tab == Tab::from(self.ext.id()) {
-                        self.ext.show(ui, &mut c);
-                    } else if tab == Tab::from(self.schedules.id()) {
-                        self.schedules.show(ui, &mut c);
-                    } else if tab == Tab::from(self.org_map.id()) {
-                        self.org_map.show(ui, &mut c);
-                    } else if tab == Tab::from(self.sessions.id()) {
-                        self.sessions.show(ui, &mut c);
-                    } else if tab == Tab::from(self.settings_screen.id()) {
-                        self.settings_screen.show(ui, &mut c);
-                    }
+                    draw(ui, tab_now, &mut c);
                 });
+        }
+        if let Some(t) = split_pick {
+            self.move_to_pane(t);
+        }
+        if split_close {
+            self.split = None;
         }
         if let Some(d) = self.dashboard.take_draft() {
             self.create_from_draft(d);
@@ -841,6 +1108,20 @@ impl App {
             self.config = AppConfig::load(&self.home);
             self.i18n = I18n::from_pref(&self.config.general.locale);
             self.sync_http();
+            // Settings > Permissions is the app-wide default for launches.
+            let mode = ToolApproval::from_extra(&self.config.extra).default;
+            if mode != self.perm {
+                self.perm = mode;
+                save_perm(&self.home, &self.team, &self.perm);
+                self.supervisor.set_permissions(permissions_of(&self.perm));
+            }
+        }
+        if self.onboarding.is_open() {
+            let home = self.home.clone();
+            self.onboarding.show(ctx, &self.i18n, &home);
+        }
+        if let Some(d) = self.onboarding.take_draft() {
+            self.create_from_draft(d);
         }
         self.apply(out, actor);
         for r in req {
@@ -1175,6 +1456,10 @@ impl App {
         if t == Tab::Teams {
             self.teams.invalidate();
         }
+        // A screen can only be drawn once: selecting the split pane's tab takes it over.
+        if self.split == Some(t) {
+            self.split = None;
+        }
         self.tab = t;
     }
 
@@ -1182,6 +1467,280 @@ impl App {
         self.open_tabs.retain(|x| *x != t);
         if self.tab == t {
             self.tab = Tab::Team;
+        }
+        if self.split == Some(t) {
+            self.split = None;
+        }
+    }
+
+    /// Show `t` in the split pane (opening it if needed); the main pane moves off it.
+    fn move_to_pane(&mut self, t: Tab) {
+        if !t.splittable() {
+            return;
+        }
+        if t.closable() && !self.open_tabs.contains(&t) {
+            self.open_tabs.push(t);
+        }
+        if self.tab == t {
+            self.tab = Tab::Team;
+        }
+        self.split = Some(t);
+    }
+
+    fn apply_tab_act(&mut self, t: Tab, act: TabAct) {
+        match act {
+            TabAct::Close => self.close_tab(t),
+            TabAct::CloseOthers => {
+                let others: Vec<Tab> = self.open_tabs.iter().copied().filter(|x| *x != t).collect();
+                for o in others {
+                    self.close_tab(o);
+                }
+            }
+            TabAct::CloseRight => {
+                if let Some(i) = self.open_tabs.iter().position(|x| *x == t) {
+                    let right: Vec<Tab> = self.open_tabs[i + 1..].to_vec();
+                    for o in right {
+                        self.close_tab(o);
+                    }
+                }
+            }
+            TabAct::MoveToPane => self.move_to_pane(t),
+            TabAct::CloseSplit => self.split = None,
+        }
+    }
+
+    /// Rebuild the palette's candidates: actions, tasks, members, messages, comments, logs.
+    fn build_palette(&mut self) {
+        use palette::{Group, Item};
+        let tr = self.i18n.clone();
+        let mut items: Vec<Item> = Vec::new();
+        let mut acts: Vec<PAct> = Vec::new();
+        let mut add =
+            |g: Group, icon: Icon, label: String, detail: String, hay: String, a: PAct| {
+                items.push(Item {
+                    group: g,
+                    icon,
+                    label,
+                    detail,
+                    haystack: hay,
+                });
+                acts.push(a);
+            };
+        let open = tr.t("common.actions.open");
+        for t in [
+            Tab::Team,
+            Tab::Dashboard,
+            Tab::Teams,
+            Tab::Usage,
+            Tab::Graph,
+            Tab::OrgMap,
+            Tab::Sessions,
+            Tab::Extensions,
+            Tab::Schedules,
+            Tab::Providers,
+            Tab::Settings,
+            Tab::Editor,
+        ] {
+            let title = self.tab_title(t, &self.team);
+            add(
+                Group::Action,
+                t.icon(),
+                format!("{open} {title}"),
+                String::new(),
+                String::new(),
+                PAct::OpenTab(t),
+            );
+        }
+        let act = |k: &str| tr.t(k);
+        add(
+            Group::Action,
+            Icon::Plus,
+            act("rteams.shell.act.newTask"),
+            String::new(),
+            String::new(),
+            PAct::NewTask,
+        );
+        add(
+            Group::Action,
+            Icon::Users,
+            act("rteams.shell.act.newTeam"),
+            String::new(),
+            String::new(),
+            PAct::NewTeam,
+        );
+        add(
+            Group::Action,
+            Icon::Play,
+            act("rteams.shell.act.launch"),
+            String::new(),
+            String::new(),
+            PAct::LaunchAll,
+        );
+        add(
+            Group::Action,
+            Icon::Square,
+            act("rteams.shell.act.stop"),
+            String::new(),
+            String::new(),
+            PAct::StopAll,
+        );
+        add(
+            Group::Action,
+            Icon::List,
+            act("rteams.shell.act.taskSidebar"),
+            String::new(),
+            String::new(),
+            PAct::ToggleTaskSidebar,
+        );
+        add(
+            Group::Action,
+            Icon::Columns,
+            act("rteams.shell.act.split"),
+            String::new(),
+            String::new(),
+            PAct::ToggleSplit,
+        );
+        for c in crate::teams::scan(&self.home)
+            .into_iter()
+            .filter(|c| !c.deleted)
+        {
+            if c.dir != self.team {
+                let name = c.name.clone().unwrap_or_else(|| c.dir.clone());
+                add(
+                    Group::Action,
+                    Icon::Users,
+                    format!("{} {name}", act("rteams.shell.act.switchTeam")),
+                    String::new(),
+                    String::new(),
+                    PAct::SwitchTeam(c.dir),
+                );
+            }
+        }
+        if let Some(d) = &self.data {
+            let st = d.state();
+            let me = self.actor();
+            for t in st.tasks.iter().filter(|t| !t.archived) {
+                let (status, _) = crate::task_dialog::status_pill(&tr, t.status);
+                let detail = match &t.owner {
+                    Some(o) => format!("{status} \u{00b7} {o}"),
+                    None => status,
+                };
+                add(
+                    Group::Task,
+                    Icon::Kanban,
+                    format!("#{} {}", t.id, t.subject),
+                    detail,
+                    t.description.clone(),
+                    PAct::Task(t.id.clone()),
+                );
+            }
+            if let Some(team) = &st.team {
+                for m in team.members.iter().filter(|m| !m.removed) {
+                    add(
+                        Group::Member,
+                        Icon::Users,
+                        m.name.clone(),
+                        m.role.clone(),
+                        String::new(),
+                        PAct::Member(m.name.clone()),
+                    );
+                }
+            }
+            let skip = st.messages.len().saturating_sub(600);
+            for m in st.messages.iter().skip(skip).rev() {
+                match &m.scope {
+                    rteams_core::Scope::Task { task } => add(
+                        Group::Comment,
+                        Icon::MessageSquare,
+                        format!("#{task} \u{00b7} {}", m.from),
+                        m.text.clone(),
+                        m.text.clone(),
+                        PAct::Task(task.clone()),
+                    ),
+                    rteams_core::Scope::Direct { to } => {
+                        let other = if Some(m.from.as_str()) == me.as_deref() {
+                            to.clone()
+                        } else {
+                            m.from.clone()
+                        };
+                        add(
+                            Group::Message,
+                            Icon::MessageSquare,
+                            format!("{} > {to}", m.from),
+                            m.text.clone(),
+                            m.text.clone(),
+                            PAct::Chat(Some(other)),
+                        )
+                    }
+                    _ => add(
+                        Group::Message,
+                        Icon::MessageSquare,
+                        m.from.clone(),
+                        m.text.clone(),
+                        m.text.clone(),
+                        PAct::Chat(None),
+                    ),
+                }
+            }
+        }
+        for a in self.supervisor.agents() {
+            for l in a.last_lines.iter().rev().take(200) {
+                add(
+                    Group::Log,
+                    Icon::Terminal,
+                    a.member.clone(),
+                    l.clone(),
+                    l.clone(),
+                    PAct::Logs,
+                );
+            }
+        }
+        self.pal_items = items;
+        self.pal_acts = acts;
+        self.pal_built = Some(std::time::Instant::now());
+    }
+
+    fn run_palette_act(&mut self, a: PAct, actor: Option<&str>) {
+        match a {
+            PAct::OpenTab(t) => self.open_tab(t),
+            PAct::NewTask => {
+                self.tab = Tab::Team;
+                self.create_task.open(None);
+            }
+            PAct::NewTeam => self.open_tab(Tab::Teams),
+            PAct::LaunchAll => self.apply(Intents(vec![Intent::LaunchAll]), actor),
+            PAct::StopAll => self.apply(Intents(vec![Intent::StopAll]), actor),
+            PAct::ToggleTaskSidebar => self.task_sidebar.toggle(),
+            PAct::ToggleSplit => {
+                if self.split.is_some() {
+                    self.split = None;
+                } else {
+                    let pick = self
+                        .open_tabs
+                        .iter()
+                        .copied()
+                        .find(|t| t.splittable() && *t != self.tab)
+                        .unwrap_or(Tab::Usage);
+                    self.move_to_pane(pick);
+                }
+            }
+            PAct::SwitchTeam(d) => self.switch_team(d),
+            PAct::Task(id) => {
+                self.tab = Tab::Team;
+                self.task_dialog.open(id);
+            }
+            PAct::Member(n) => {
+                self.tab = Tab::Team;
+                self.member_dialog.open(n);
+            }
+            PAct::Chat(c) => {
+                self.tab = Tab::Team;
+                self.apply(Intents(vec![Intent::OpenChat(c)]), actor);
+            }
+            PAct::Logs => {
+                self.tab = Tab::Team;
+                self.show_logs = true;
+            }
         }
     }
 
@@ -1294,6 +1853,13 @@ impl App {
         let mut terminal = false;
         let mut new_team = false;
         let mut bell = false;
+        let mut tab_act: Option<(Tab, TabAct)> = None;
+        let mut drop_to: Option<(Tab, usize)> = None;
+        let mut toggle_sidebar = false;
+        let mut toggle_split = false;
+        let mut open_palette = false;
+        let sidebar_open = self.task_sidebar.is_open();
+        let split_open = self.split.is_some();
         let mut lang = self.i18n.clone();
         let mut locale_changed = false;
         let unread = self.center.unread();
@@ -1339,7 +1905,7 @@ impl App {
                     rect.bottom() - 0.5,
                     egui::Stroke::new(1.0, theme::hairline(0.07)),
                 );
-                let right_w = 140.0;
+                let right_w = 232.0;
                 let left_rect = egui::Rect::from_min_max(
                     rect.min,
                     egui::pos2((rect.right() - right_w).max(rect.left()), rect.bottom()),
@@ -1417,6 +1983,8 @@ impl App {
                                         }
                                     });
                                 }
+                                let mut closable_rects: Vec<(Tab, egui::Rect)> = Vec::new();
+                                let mut dragging: Option<Tab> = None;
                                 for (t, label) in &titles {
                                     let c = chip(
                                         ui,
@@ -1436,9 +2004,101 @@ impl App {
                                     if c.main.middle_clicked() && t.closable() {
                                         close = Some(*t);
                                     }
-                                    if c.close.is_some_and(|x| x.clicked()) {
+                                    if c.close.as_ref().is_some_and(|x| x.clicked()) {
                                         close = Some(*t);
                                     }
+                                    if t.closable() {
+                                        closable_rects.push((*t, c.main.rect));
+                                        if c.main.dragged() {
+                                            dragging = Some(*t);
+                                        }
+                                        if c.main.drag_stopped() {
+                                            if let Some(p) = c.main.interact_pointer_pos() {
+                                                let slot =
+                                                    closable_rects_slot(&closable_rects, p.x);
+                                                drop_to = Some((*t, slot));
+                                            }
+                                        }
+                                    }
+                                    c.main.context_menu(|ui| {
+                                        ui.set_min_width(200.0);
+                                        let tk = |k: &str| tr.t(k);
+                                        if t.closable()
+                                            && theme::menu_item(
+                                                ui,
+                                                Some(Icon::X),
+                                                &tk("common.actions.close"),
+                                            )
+                                            .clicked()
+                                        {
+                                            tab_act = Some((*t, TabAct::Close));
+                                            ui.close();
+                                        }
+                                        if t.closable()
+                                            && theme::menu_item(
+                                                ui,
+                                                None,
+                                                &tk("rteams.shell.tab.closeOthers"),
+                                            )
+                                            .clicked()
+                                        {
+                                            tab_act = Some((*t, TabAct::CloseOthers));
+                                            ui.close();
+                                        }
+                                        if t.closable()
+                                            && theme::menu_item(
+                                                ui,
+                                                None,
+                                                &tk("rteams.shell.tab.closeRight"),
+                                            )
+                                            .clicked()
+                                        {
+                                            tab_act = Some((*t, TabAct::CloseRight));
+                                            ui.close();
+                                        }
+                                        if t.splittable()
+                                            && theme::menu_item(
+                                                ui,
+                                                Some(Icon::Columns),
+                                                &tk("rteams.shell.tab.moveToPane"),
+                                            )
+                                            .clicked()
+                                        {
+                                            tab_act = Some((*t, TabAct::MoveToPane));
+                                            ui.close();
+                                        }
+                                        if split_open
+                                            && theme::menu_item(
+                                                ui,
+                                                None,
+                                                &tk("rteams.shell.tab.closeSplit"),
+                                            )
+                                            .clicked()
+                                        {
+                                            tab_act = Some((*t, TabAct::CloseSplit));
+                                            ui.close();
+                                        }
+                                    });
+                                }
+                                if let (Some(d), Some(p)) =
+                                    (dragging, ui.input(|i| i.pointer.interact_pos()))
+                                {
+                                    let slot = closable_rects_slot(&closable_rects, p.x);
+                                    if let Some((_, r)) = closable_rects
+                                        .get(slot.min(closable_rects.len().saturating_sub(1)))
+                                    {
+                                        let x = if slot >= closable_rects.len() {
+                                            r.right() + 2.0
+                                        } else {
+                                            r.left() - 2.0
+                                        };
+                                        ui.painter().vline(
+                                            x,
+                                            r.y_range(),
+                                            egui::Stroke::new(2.0, theme::ACCENT),
+                                        );
+                                    }
+                                    let _ = d;
                                 }
                             });
                         });
@@ -1501,12 +2161,57 @@ impl App {
                         {
                             new_team = true;
                         }
+                        if theme::icon_button_active(
+                            ui,
+                            Icon::Columns,
+                            &tr.t("rteams.shell.act.split"),
+                            split_open,
+                        )
+                        .clicked()
+                        {
+                            toggle_split = true;
+                        }
+                        if theme::icon_button_active(
+                            ui,
+                            Icon::List,
+                            &tr.t("rteams.shell.act.taskSidebar"),
+                            sidebar_open,
+                        )
+                        .clicked()
+                        {
+                            toggle_sidebar = true;
+                        }
+                        if theme::icon_button(
+                            ui,
+                            Icon::Search,
+                            &format!("{} (Ctrl+K)", tr.t("rteams.shell.palette.title")),
+                        )
+                        .clicked()
+                        {
+                            open_palette = true;
+                        }
                     },
                 );
             });
         self.tab_scrolled = Some(current);
         if terminal {
             self.terminal.toggle();
+        }
+        if open_palette {
+            self.palette.open(false);
+            self.pal_built = None;
+        }
+        if toggle_sidebar {
+            self.task_sidebar.toggle();
+        }
+        if toggle_split {
+            self.run_palette_act(PAct::ToggleSplit, actor);
+        }
+        if let Some((t, slot)) = drop_to {
+            move_to_slot(&mut self.open_tabs, t, slot);
+        }
+        if let Some((t, act)) = tab_act {
+            self.apply_tab_act(t, act);
         }
         if bell {
             self.center.open();
@@ -1559,6 +2264,17 @@ impl eframe::App for App {
             self.terminal.toggle();
         }
 
+        let (k, shift) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::K),
+                i.modifiers.shift,
+            )
+        });
+        if k {
+            self.palette.open(shift);
+            self.pal_built = None;
+        }
+
         if self.data.is_none() {
             self.try_open();
         }
@@ -1588,8 +2304,29 @@ impl eframe::App for App {
         if self.tab.closable() && !self.open_tabs.contains(&self.tab) {
             self.open_tabs.push(self.tab);
         }
+        self.tick_launch_requests();
         self.tab_bar(ui, &title, actor.as_deref());
         self.toasts(&ctx);
+        if let Some(p) = self
+            .task_sidebar
+            .show(ui, &self.home, &self.team, &self.i18n)
+        {
+            self.switch_team(p.team);
+            self.task_dialog.open(p.task);
+        }
+        if self.palette.is_open() {
+            if self
+                .pal_built
+                .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+            {
+                self.build_palette();
+            }
+            if let Some(i) = self.palette.show(&ctx, &self.i18n, &self.pal_items) {
+                if let Some(a) = self.pal_acts.get(i).cloned() {
+                    self.run_palette_act(a, actor.as_deref());
+                }
+            }
+        }
         self.center.show(&ctx, &self.i18n, &mut Intents::default());
         if self.phase2(ui, &ctx, actor.as_deref()) {
             return;
@@ -1638,6 +2375,16 @@ impl eframe::App for App {
                         ui.label(RichText::new(self.i18n.t("rteams.noTeam")).color(theme::MUTED));
                     }
                 });
+            if let Some(cmd) = self.providers.take_login() {
+                // The terminal has no write-a-line API: open it in the project and put the
+                // sign-in command on the clipboard to paste.
+                let cwd = self
+                    .project()
+                    .unwrap_or_else(|| PathBuf::from(self.workdir.trim()));
+                self.terminal.open(cwd);
+                ctx.copy_text(cmd.clone());
+                self.last = Some(Ok(format!("{cmd}  (copied: paste it in the terminal)")));
+            }
             if recovery_changed {
                 let mut cfg = AppConfig::load(&self.home);
                 cfg.recovery = self.config.recovery.clone();
@@ -1669,6 +2416,21 @@ impl eframe::App for App {
             }
             if let Some(d) = self.teams.take_draft() {
                 self.create_from_draft(d);
+            }
+            if let (Some((dir, name)), Some(a)) = (self.teams.take_rename_request(), &actor) {
+                let r = Commander::new(home.clone(), dir.clone())
+                    .run(a, &GuiCmd::RenameTeam { name: name.clone() });
+                self.last = Some(r.map(|_| {
+                    self.i18n
+                        .t_args("rteams.toast.renamedTeam", &[("dir", &name)])
+                }));
+                self.teams.invalidate();
+            }
+            if let Some(dir) = self.teams.take_purge_request() {
+                let r = rteams_store::FileStore::delete_team_permanently(&home, &dir)
+                    .map_err(|e| e.to_string());
+                self.last = Some(r.map(|_| format!("Deleted {dir} forever")));
+                self.teams.invalidate();
             }
             if let (Some((dir, deleted)), Some(a)) = (self.teams.take_delete_request(), &actor) {
                 let r = Commander::new(home.clone(), dir.clone())
@@ -1827,6 +2589,10 @@ impl eframe::App for App {
                             },
                         );
                         self.filter.folder = self.folders.folder_filter();
+                        let repo = team_project(v.state);
+                        self.filter
+                            .changes
+                            .set_paths(&self.home, &self.team, repo.as_deref());
                         let open_tasks = v.state.tasks.iter().filter(|t| !t.archived).count();
                         theme::section(
                             ui,
@@ -1846,7 +2612,7 @@ impl eframe::App for App {
                                 });
                             },
                         );
-                        team::processes(ui, &v);
+                        team::processes(ui, &v, &mut intents);
                         self.logs.show(ui, &v);
                         let mut c = FeatureCtx {
                             home: &self.home,
@@ -1856,6 +2622,16 @@ impl eframe::App for App {
                             tr: &self.i18n,
                             req: &mut team_reqs,
                         };
+                        theme::section(
+                            ui,
+                            "activity",
+                            "📜",
+                            &self.i18n.t("rteams.shell.activity.title"),
+                            None,
+                            true,
+                            |_| {},
+                            |ui| activity::show(ui, &v),
+                        );
                         theme::section(
                             ui,
                             "queue",
@@ -1919,6 +2695,7 @@ impl eframe::App for App {
             &mut intents,
         );
         self.approvals.show(&ctx, &v, &mut intents);
+        let launched = self.launch_dialog.show(&ctx, &v, &mut intents);
         if let Some(p) = self.settings.take_permissions_choice() {
             self.perm = normalize_perm(&p).to_string();
             save_perm(&self.home, &self.team, &self.perm);
@@ -1929,6 +2706,9 @@ impl eframe::App for App {
             intents.push(Intent::CloseTask);
         }
         self.apply(intents, actor.as_deref());
+        if let Some(o) = launched {
+            self.launch_with_options(o);
+        }
         for r in team_reqs {
             self.handle_request(r, actor.as_deref());
         }
@@ -1962,7 +2742,12 @@ fn chip(
         .layout_no_wrap(label, font, egui::Color32::PLACEHOLDER);
     let extra = if closable || chevron { 26.0 } else { 0.0 };
     let w = (14.0 + 16.0 + 8.0 + galley.size().x + extra + 12.0).max(min_w);
-    let (rect, main) = ui.allocate_exact_size(egui::vec2(w, 32.0), egui::Sense::click());
+    let sense = if closable {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::click()
+    };
+    let (rect, main) = ui.allocate_exact_size(egui::vec2(w, 32.0), sense);
     let side = |ui: &egui::Ui, id: &str| {
         let r = egui::Rect::from_center_size(
             egui::pos2(rect.right() - 20.0, rect.center().y),
@@ -2045,6 +2830,11 @@ fn chip(
     }
 }
 
+/// Insertion slot for a tab dropped at pointer `x`: the number of tab centres left of it.
+fn closable_rects_slot(rects: &[(Tab, egui::Rect)], x: f32) -> usize {
+    rects.iter().filter(|(_, r)| r.center().x < x).count()
+}
+
 /// Small red count badge centred at `at` (e.g. on the bell).
 fn badge(ui: &egui::Ui, at: egui::Pos2, n: usize) {
     let text = if n > 99 {
@@ -2090,6 +2880,34 @@ mod tests {
     }
 
     #[test]
+    fn tab_reorder_and_close_actions() {
+        let mut v = vec![1, 2, 3, 4];
+        move_to_slot(&mut v, 1, 3);
+        assert_eq!(v, [2, 3, 1, 4]);
+        move_to_slot(&mut v, 4, 0);
+        assert_eq!(v, [4, 2, 3, 1]);
+        move_to_slot(&mut v, 2, 2);
+        assert_eq!(v, [4, 2, 3, 1]);
+        let ctx = egui::Context::default();
+        let mut app = App::new(
+            &ctx,
+            std::env::temp_dir().join("rteams-gui-tabs-none"),
+            "t".into(),
+            None,
+        );
+        for t in [Tab::Usage, Tab::Graph, Tab::Sessions] {
+            app.open_tab(t);
+        }
+        app.apply_tab_act(Tab::Graph, TabAct::CloseRight);
+        assert_eq!(app.open_tabs, [Tab::Usage, Tab::Graph]);
+        app.apply_tab_act(Tab::Usage, TabAct::MoveToPane);
+        assert_eq!(app.split, Some(Tab::Usage));
+        app.apply_tab_act(Tab::Graph, TabAct::CloseOthers);
+        assert_eq!(app.open_tabs, [Tab::Graph]);
+        assert_eq!(app.split, None);
+    }
+
+    #[test]
     fn every_screen_renders_headless() {
         let home = std::env::temp_dir().join(format!("rteams-gui-app-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -2132,6 +2950,20 @@ mod tests {
             app.tab = t;
             frames(&mut app);
         }
+        // Shell chrome: split pane, task sidebar, palette, global search.
+        app.tab = Tab::Team;
+        app.move_to_pane(Tab::Usage);
+        app.task_sidebar.toggle();
+        frames(&mut app);
+        app.palette.open(false);
+        app.palette.set_query("task");
+        frames(&mut app);
+        app.palette.open(true);
+        app.palette.set_query("hello");
+        frames(&mut app);
+        app.palette.close();
+        app.split = None;
+        app.task_sidebar.toggle();
         app.terminal.toggle();
         frames(&mut app);
         let _ = std::fs::remove_dir_all(&home);
@@ -2158,6 +2990,9 @@ mod screenshots {
             .with_accessibility_check(false)
             .wgpu()
             .build_eframe(|cc| App::new(&cc.egui_ctx, home.clone(), team.clone(), None));
+        // Live agent text can hold any emoji; draw tofu like the real app instead of panicking.
+        h.ctx
+            .set_missing_glyph_policy(egui::epaint::text::MissingGlyphPolicy::Tofu);
         setup(h.state_mut());
         h.run_steps(6);
         let img = h.render().expect("render");
@@ -2266,6 +3101,17 @@ mod screenshots {
             a.member_dialog.show_edit_tab_for_tests();
         });
         shoot(&out, "create_task", |a| a.create_task.open(None));
+        shoot(&out, "palette", |a| a.palette.open(false));
+        shoot(&out, "palette_search", |a| {
+            a.palette.open(true);
+            a.palette.set_query("task");
+        });
+        shoot(&out, "split_panes", |a| {
+            a.open_tab(Tab::Usage);
+            a.move_to_pane(Tab::Graph);
+        });
+        shoot(&out, "task_sidebar", |a| a.task_sidebar.toggle());
+        shoot(&out, "inbox", |a| a.messages.open_inbox_for_tests());
         shoot(&out, "add_member", |a| {
             a.try_open();
             let taken = a.member_names();

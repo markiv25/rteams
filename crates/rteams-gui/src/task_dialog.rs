@@ -16,6 +16,7 @@ use crate::git;
 use crate::icons::{self, Icon};
 use crate::runs::{self, RunEvent, RunKind};
 use crate::theme;
+use crate::ui::review::{ReviewCtx, ReviewDialog};
 use crate::view::{Intent, Intents, View};
 use rteams_services::i18n::I18n;
 
@@ -93,6 +94,22 @@ struct Draft {
     kept: HashSet<String>,
     /// Run-file analysis, refreshed every few seconds.
     runs: Option<RunsCache>,
+    /// Hunk-level review dialog over the changed files.
+    review: ReviewDialog,
+    /// Image thumbnails by resolved path (`None` = not decodable).
+    thumbs: std::collections::HashMap<String, Thumb>,
+    /// Last attach failure.
+    attach_err: Option<String>,
+}
+
+/// Cached thumbnail texture (`None` = not decodable).
+#[derive(Default)]
+struct Thumb(Option<egui::TextureHandle>);
+
+impl std::fmt::Debug for Thumb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Thumb")
+    }
 }
 
 /// Interval between re-reads of run files and git diffs while the dialog is open.
@@ -163,6 +180,7 @@ fn diff_counts(diff: &str) -> (usize, usize) {
 }
 
 /// File name part of a path, for attachments.
+#[cfg(test)]
 fn base_name(path: &str) -> String {
     Path::new(path.trim()).file_name().map_or_else(
         || path.trim().to_string(),
@@ -170,7 +188,7 @@ fn base_name(path: &str) -> String {
     )
 }
 
-fn open_external(path: &str) {
+pub(crate) fn open_external(path: &str) {
     #[cfg(target_os = "macos")]
     let cmd = "open";
     #[cfg(target_os = "windows")]
@@ -309,8 +327,68 @@ impl TaskDialog {
         );
         if !open {
             out.push(Intent::CloseTask);
+            return;
+        }
+        // Files dropped onto the window become attachments of this task.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        for p in dropped {
+            ingest_attachment(&env, &id, &p, draft, out);
+        }
+        if let Some(repo) = env.repo {
+            let was_open = draft.review.is_open();
+            let rc = ReviewCtx {
+                home: env.home,
+                team: env.team,
+                repo,
+                task: &id,
+            };
+            draft.review.show(ctx, v, &rc, out);
+            if was_open {
+                // Rejected hunks change the working tree; re-read the diffs.
+                draft.runs = None;
+            }
         }
     }
+}
+
+/// Copy `path` into the team's attachment store and attach it to `task`.
+fn ingest_attachment(env: &Env, task: &str, path: &Path, dr: &mut Draft, out: &mut Intents) {
+    match rteams_services::attachments::store(env.home, env.team, path) {
+        Ok(a) => {
+            dr.attach_err = None;
+            out.push(Intent::Run(GuiCmd::AttachFile {
+                task: task.to_string(),
+                name: a.name,
+                path: a.path,
+            }));
+        }
+        Err(e) => dr.attach_err = Some(e.to_string()),
+    }
+}
+
+/// Square thumbnail texture for an image attachment, cached per path.
+fn thumb<'a>(ui: &egui::Ui, dr: &'a mut Draft, path: &Path) -> Option<&'a egui::TextureHandle> {
+    let key = path.to_string_lossy().into_owned();
+    dr.thumbs
+        .entry(key.clone())
+        .or_insert_with(|| {
+            Thumb(
+                rteams_services::attachments::thumbnail(path, 160).map(|(w, h, rgba)| {
+                    let img =
+                        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                    ui.ctx()
+                        .load_texture(format!("att:{key}"), img, Default::default())
+                }),
+            )
+        })
+        .0
+        .as_ref()
 }
 
 fn pad<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -550,7 +628,7 @@ fn body(ui: &mut egui::Ui, v: &View, env: &Env, d: &TaskDetail, dr: &mut Draft, 
         None,
         !atts.is_empty(),
         |_| {},
-        |ui| pad(ui, |ui| attachments(ui, v.tr, d, atts, dr, out)),
+        |ui| pad(ui, |ui| attachments(ui, v.tr, env, d, atts, dr, out)),
     );
 
     let nfiles = dr.runs.as_ref().map_or(0, |c| c.files.len());
@@ -582,7 +660,12 @@ fn body(ui: &mut egui::Ui, v: &View, env: &Env, d: &TaskDetail, dr: &mut Draft, 
         None,
         false,
         |_| {},
-        |ui| pad(ui, |ui| task_logs(ui, v, &log, lines)),
+        |ui| {
+            pad(ui, |ui| {
+                task_logs(ui, v, &log, lines);
+                crate::logs::task_log_section(ui, v, &d.id);
+            })
+        },
     );
 
     sect(
@@ -1132,6 +1215,7 @@ fn clip_chars(s: &str, n: usize) -> String {
 fn attachments(
     ui: &mut egui::Ui,
     tr: &I18n,
+    env: &Env,
     d: &TaskDetail,
     atts: &[rteams_core::Attachment],
     dr: &mut Draft,
@@ -1140,19 +1224,45 @@ fn attachments(
     if atts.is_empty() {
         ui.label(RichText::new(tr.t("rteams.task.noAttachments")).color(theme::MUTED));
     }
+    let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
     for a in atts {
+        let resolved = rteams_services::attachments::resolve(env.home, env.team, a);
         ui.horizontal_wrapped(|ui| {
+            if rteams_services::attachments::is_image(a) {
+                if let Some(t) = thumb(ui, dr, &resolved) {
+                    let size = t.size_vec2();
+                    let k = (56.0 / size.x.max(size.y)).min(1.0);
+                    ui.image((t.id(), size * k));
+                }
+            }
             if ui
                 .link(&a.name)
                 .on_hover_text(tr.t_args("rteams.task.openPath", &[("path", &a.path)]))
                 .clicked()
             {
-                open_external(&a.path);
+                open_external(&resolved.to_string_lossy());
             }
             ui.label(RichText::new(&a.path).small().color(theme::MUTED));
         });
     }
+    if hovering {
+        theme::pill(ui, tr.t("rteams.attach.drop"), theme::ACCENT);
+    }
     ui.horizontal_wrapped(|ui| {
+        if theme::pill_icon_button(
+            ui,
+            Some(Icon::Paperclip),
+            &tr.t("rteams.attach.browse"),
+            false,
+        )
+        .clicked()
+        {
+            if let Some(files) = rfd::FileDialog::new().pick_files() {
+                for f in files {
+                    ingest_attachment(env, &d.id, &f, dr, out);
+                }
+            }
+        }
         let w = (ui.available_width() - 100.0).clamp(60.0, 360.0);
         ui.add(
             egui::TextEdit::singleline(&mut dr.attach_path)
@@ -1164,15 +1274,14 @@ fn attachments(
             .add_enabled(ready, egui::Button::new(tr.t("rteams.task.attachFile")))
             .clicked()
         {
-            let path = dr.attach_path.trim().to_string();
-            out.push(Intent::Run(GuiCmd::AttachFile {
-                task: d.id.clone(),
-                name: base_name(&path),
-                path,
-            }));
+            let path = PathBuf::from(dr.attach_path.trim());
+            ingest_attachment(env, &d.id, &path, dr, out);
             dr.attach_path.clear();
         }
     });
+    if let Some(e) = &dr.attach_err {
+        ui.label(RichText::new(e).small().color(theme::ERROR_FG));
+    }
 }
 
 /// Task Logs: recorded run events attributed to the task, else the launcher's summarized lines.
@@ -1322,6 +1431,10 @@ fn changes(
         ui.label(RichText::new(format!("+{ta}")).small().color(DIFF_ADD_FG));
         ui.label(RichText::new(format!("-{tdel}")).small().color(DIFF_DEL_FG));
     });
+    if theme::pill_button(ui, &tr.t("team.taskDetail.changes.reviewDiff"), true).clicked() {
+        dr.review
+            .open(cache.files.iter().map(|f| f.path.clone()).collect());
+    }
     let mut toggle: Option<String> = None;
     let mut keep: Option<String> = None;
     let mut revert: Option<String> = None;

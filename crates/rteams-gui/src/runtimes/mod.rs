@@ -10,8 +10,12 @@ use std::time::{Duration, Instant};
 
 pub mod claude;
 pub mod codex;
+pub mod compat;
+pub mod copilot;
 pub mod cursor;
 pub mod gemini;
+pub mod grok;
+pub mod kiro;
 pub mod opencode;
 pub mod qwen;
 
@@ -55,6 +59,14 @@ pub struct LaunchCtx {
     /// Session to resume, when the runtime supports it.
     pub resume: Option<String>,
     pub workdir: PathBuf,
+    /// `low|medium|high|xhigh|max`, where the runtime has a reasoning-effort knob.
+    pub effort: Option<String>,
+    /// Fast mode, where the runtime has one.
+    pub fast: bool,
+    /// Context window cap in tokens, where the runtime can limit it.
+    pub context_limit: Option<u32>,
+    /// Extra MCP servers (name -> `{command,args,env}` / `{url}` JSON) beside `rteams`.
+    pub extra_mcp: Vec<(String, serde_json::Value)>,
 }
 
 pub trait AgentRuntime: Send + Sync {
@@ -72,6 +84,14 @@ pub trait AgentRuntime: Send + Sync {
     /// Session id announced on this output line, if any.
     fn session_id(&self, line: &str) -> Option<String>;
     fn supports_resume(&self) -> bool;
+    /// Command that signs the user in (run in a terminal), when the CLI has one.
+    fn login_command(&self) -> Option<&'static str> {
+        None
+    }
+    /// Env var holding the provider API key, for runtimes that take one (shows "Connect").
+    fn api_key_env(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -315,10 +335,21 @@ pub fn mcp_server_entry(ctx: &LaunchCtx, trust: bool) -> serde_json::Value {
 
 /// Merge the rteams server into `<workdir>/<rel>` under `mcpServers`, keeping other entries.
 /// Returns the file written.
+#[cfg(test)]
 pub fn write_mcp_servers_file(
     workdir: &Path,
     rel: &str,
     entry: serde_json::Value,
+) -> std::io::Result<PathBuf> {
+    write_mcp_servers_file_with(workdir, rel, entry, &[])
+}
+
+/// Like [`write_mcp_servers_file`], also adding `extras` (never replacing `rteams`).
+pub fn write_mcp_servers_file_with(
+    workdir: &Path,
+    rel: &str,
+    entry: serde_json::Value,
+    extras: &[(String, serde_json::Value)],
 ) -> std::io::Result<PathBuf> {
     let path = workdir.join(rel);
     if let Some(d) = path.parent() {
@@ -332,12 +363,25 @@ pub fn write_mcp_servers_file(
     if !doc["mcpServers"].is_object() {
         doc["mcpServers"] = serde_json::json!({});
     }
+    for (k, v) in extras.iter().filter(|(k, _)| k != "rteams") {
+        doc["mcpServers"][k] = v.clone();
+    }
     doc["mcpServers"]["rteams"] = entry;
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&doc).unwrap_or_default(),
     )?;
     Ok(path)
+}
+
+/// `{"mcpServers": {rteams, ..extras}}` for runtimes that take the whole document inline.
+pub fn mcp_doc(ctx: &LaunchCtx, trust: bool) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for (k, v) in ctx.extra_mcp.iter().filter(|(k, _)| k != "rteams") {
+        m.insert(k.clone(), v.clone());
+    }
+    m.insert("rteams".into(), mcp_server_entry(ctx, trust));
+    serde_json::json!({ "mcpServers": m })
 }
 
 /// System prompt + task for CLIs without a system-prompt flag.
@@ -361,6 +405,24 @@ pub(crate) fn base_command(ctx: &LaunchCtx) -> Command {
         c.env(k, v);
     }
     c
+}
+
+/// Value of an API key: process env first, then the rteams key store.
+pub(crate) fn find_key(names: &[&str]) -> Option<String> {
+    for n in names {
+        if let Ok(v) = std::env::var(n) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    let stored = rteams_services::ext::apikeys::env_for("opencode");
+    names.iter().find_map(|n| {
+        stored
+            .iter()
+            .find(|(k, v)| k == n && !v.is_empty())
+            .map(|(_, v)| v.clone())
+    })
 }
 
 #[cfg(test)]
@@ -409,6 +471,7 @@ pub(crate) mod testutil {
             permissions: perms.into(),
             resume: None,
             workdir: std::env::temp_dir(),
+            ..Default::default()
         }
     }
     pub fn tmpdir(tag: &str) -> PathBuf {
@@ -478,7 +541,22 @@ mod tests {
         let ids: Vec<_> = all().iter().map(|r| r.id()).collect();
         assert_eq!(
             ids,
-            ["claude", "codex", "opencode", "cursor", "gemini", "qwen"]
+            [
+                "claude",
+                "codex",
+                "opencode",
+                "cursor",
+                "gemini",
+                "qwen",
+                "copilot",
+                "grok",
+                "kiro",
+                "zai",
+                "minimax",
+                "openrouter",
+                "ollama",
+                "lmstudio"
+            ]
         );
         assert_eq!(get(None).unwrap().id(), "claude");
         assert_eq!(get(Some("codex")).unwrap().id(), "codex");
@@ -495,6 +573,14 @@ pub fn all() -> Vec<Box<dyn AgentRuntime>> {
         Box::new(cursor::Cursor::default()),
         Box::new(gemini::Gemini::default()),
         Box::new(qwen::Qwen::default()),
+        Box::new(copilot::Copilot::default()),
+        Box::new(grok::Grok::default()),
+        Box::new(kiro::Kiro::default()),
+        Box::new(compat::Compat::zai()),
+        Box::new(compat::Compat::minimax()),
+        Box::new(compat::Compat::openrouter()),
+        Box::new(compat::Compat::ollama()),
+        Box::new(compat::Compat::lmstudio()),
     ]
 }
 

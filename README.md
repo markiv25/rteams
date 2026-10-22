@@ -128,6 +128,17 @@ cargo build --release -p rteams-gui -p rteams-cli   # gui finds `rteams` next to
 Flags: `--home DIR` (env `RTEAMS_HOME`, required), `--team NAME` (env `RTEAMS_TEAM`, default
 `default`), `--as NAME` (env `RTEAMS_ACTOR`, default: the team's lead).
 
+## Terminal UI (rteams-tui)
+
+```sh
+cargo run -p rteams-tui -- --home ~/.rteams --team NAME [--as NAME]
+```
+
+Five-column kanban, task detail, messages and a command line. Writes go through the same
+server tools as the GUI; the view tails the log and refreshes every 500 ms. Keys: arrows or
+`hjkl` move, `Enter` opens a task (its comments show), `m` message (`@name text` is direct,
+otherwise broadcast), `c` comment, `s` start, `d` done, `q` quit.
+
 ## Things to know when calling the tools
 
 - **`actor` is explicit.** The server has no login: write tools take `actor` (your member name)
@@ -144,18 +155,28 @@ Flags: `--home DIR` (env `RTEAMS_HOME`, required), `--team NAME` (env `RTEAMS_TE
   `unknown_member`, ...) come back as tool results with `isError: true` and a `{code, message}`
   body, so the model can read and react. Malformed arguments and unknown tools are JSON-RPC
   `-32602` errors.
-- **Tools:** `team_create`, `team_get`, `task_create`, `task_get`, `task_list`, `task_start`,
-  `task_complete`, `task_set_dependencies`, `task_set_owner`, `task_update`, `member_add`, `member_update`, `member_remove`, `team_configure`, `task_add_comment`, `task_block`,
-  `task_unblock`, `task_archive`, `task_briefing`, `member_briefing`, `kanban_get`,
-  `review_request`, `review_approve`, `review_request_changes`, `message_send`, `inbox_get`,
-  `process_register`, `process_list`, `process_unregister`, plus: `task_set_clarification`,
-  `task_attach_file`, `task_link`, `task_unlink`, `review_start`, `kanban_set_order` (lead),
-  `team_delete` (lead; a deleted team rejects all writes except `deleted=false`), `message_react`
-  (toggle), `schedule_set` / `schedule_remove` (lead), `permission_decide` (lead),
-  `task_create_from_message`, and `permission_request`. `member_add` / `member_update` accept
-  `runtime` (`claude` default, `codex`, `opencode`, `cursor`, `gemini`, ...) and `member_update`
-  accepts `worktree`; `message_send` accepts `from_team` for cross-team delivery.
-  `tools/list` is the source of truth.
+- **Tools (76; all 51 of the original app's MCP tools plus 25 rteams-only):**
+  Team: `team_create`, `team_get`, `team_list`, `team_configure`, `team_update`, `team_launch`,
+  `team_stop`, `team_trash`, `team_delete`, `team_get_launch_state`, `member_add`, `member_update`,
+  `member_remove`, `member_briefing`, `lead_briefing`, `task_briefing`, `app_get_connection_info`.
+  Tasks: `task_create`, `task_create_from_message`, `task_get`, `task_list`, `task_update`,
+  `task_start`, `task_complete`, `task_set_status`, `task_set_owner`, `task_set_dependencies`,
+  `task_link`, `task_unlink`, `task_block`, `task_unblock`, `task_archive`, `task_restore`,
+  `task_set_clarification`, `task_attach_file`, `task_add_comment`, `task_get_comment`,
+  `task_comment_files`, `task_attach_comment_file`. Kanban / review: `kanban_get`,
+  `kanban_set_order`, `kanban_set_column`, `kanban_clear`, `kanban_add_reviewer`,
+  `kanban_remove_reviewer`, `kanban_list_reviewers`, `review_request`, `review_start`,
+  `review_approve`, `review_request_changes`. Messages: `message_send`, `message_react`,
+  `inbox_get`, `group_chat_create` / `_update` / `_delete` / `_list`, `cross_team_list_targets`,
+  `cross_team_send`, `cross_team_get_outbox`. Processes: `process_register`, `process_list`,
+  `process_stop`, `process_unregister`. Runtime: `runtime_heartbeat`, `runtime_bootstrap_checkin`,
+  `runtime_deliver`, `runtime_deliver_message`, `runtime_task_event`. Work sync:
+  `member_work_sync_status`, `member_work_sync_report`, `member_work_sync_ack`. Schedules /
+  permissions: `schedule_set`, `schedule_remove`, `permission_request`, `permission_decide`.
+  Lead-only: team lifecycle, `kanban_*` column/reviewer writes, `schedule_*`, `permission_decide`,
+  `lead_briefing`. `member_add` / `member_update` accept `runtime` (`claude` default, `codex`,
+  `opencode`, `cursor`, `gemini`, ...); `member_update` also takes `worktree`, `effort`, `fast`,
+  `context_limit`, `mcp_allow` (lead only). `tools/list` is the source of truth.
 
 `permission_request {tool_name, input}` is the Claude `--permission-prompt-tool` contract: it
 records a request for `RTEAMS_MEMBER`, then blocks (polling the shared log every 500 ms, without

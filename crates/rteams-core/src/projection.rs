@@ -99,7 +99,9 @@ pub struct Briefing {
 }
 
 fn reason_for(state: &State, t: &Task, member: &str) -> Option<Reason> {
-    if t.status == Status::Review && t.reviewer.as_deref() == Some(member) {
+    if t.status == Status::Review
+        && (t.reviewer.as_deref() == Some(member) || t.reviewers.iter().any(|r| r == member))
+    {
         return Some(Reason::Review);
     }
     if t.owner.as_deref() != Some(member) {
@@ -368,8 +370,13 @@ pub fn inbox(state: &State, member: &str, after: u64) -> Inbox {
             Scope::Direct { to } => to == member,
             Scope::Broadcast => true,
             Scope::Task { task } => state.task(task).is_some_and(|t| {
-                t.owner.as_deref() == Some(member) || t.reviewer.as_deref() == Some(member)
+                t.owner.as_deref() == Some(member)
+                    || t.reviewer.as_deref() == Some(member)
+                    || t.reviewers.iter().any(|r| r == member)
             }),
+            Scope::Group { chat } => state
+                .group(chat)
+                .is_some_and(|g| g.members.iter().any(|x| x == member)),
         })
         .cloned()
         .collect();

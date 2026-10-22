@@ -24,6 +24,44 @@ pub struct Member {
     /// Avatar icon (an emoji) picked for this member; `None` uses the GUI's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Reasoning effort: low | medium | high.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Fast mode.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fast: bool,
+    /// Context window limit (tokens) for this member's runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u32>,
+    /// Extra MCP server names this member may use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_allow: Vec<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// A user-created subset chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupChat {
+    pub id: String,
+    pub name: String,
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub created_by: String,
+}
+
+/// Last heartbeat reported by a member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatInfo {
+    /// starting | ready | working | idle | stuck
+    pub status: String,
+    #[serde(default)]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub ts: i64,
 }
 
 /// A recurring prompt for a member.
@@ -62,6 +100,8 @@ pub struct Team {
     pub column_order: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub schedules: Vec<Schedule>,
+    #[serde(default)]
+    pub group_chats: Vec<GroupChat>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +139,9 @@ pub struct Task {
     pub blocked_by: Vec<String>,
     /// Set by the last review request.
     pub reviewer: Option<String>,
+    /// Extra reviewers besides `reviewer`.
+    #[serde(default)]
+    pub reviewers: Vec<String>,
     /// While `Blocked`: the status to return to on unblock.
     pub blocked_from: Option<Status>,
     pub blocked_reason: Option<String>,
@@ -123,9 +166,17 @@ pub struct Task {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum Scope {
-    Task { task: String },
-    Direct { to: String },
+    Task {
+        task: String,
+    },
+    Direct {
+        to: String,
+    },
     Broadcast,
+    /// A user-created subset group chat.
+    Group {
+        chat: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +196,8 @@ pub struct Message {
     pub from_team: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<Reaction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

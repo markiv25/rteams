@@ -66,6 +66,8 @@ pub struct BoardFilter {
     pub show_trash: bool,
     /// Only these task ids (the selected task folder), when set.
     pub folder: Option<std::collections::HashSet<String>>,
+    /// Per-task change summaries (files, +/-), refreshed on a worker thread.
+    pub changes: crate::changes::ChangeSummaries,
 }
 
 impl BoardFilter {
@@ -184,6 +186,7 @@ struct Ctx<'a> {
     v: &'a View<'a>,
     comments: HashMap<&'a str, usize>,
     last_touch: HashMap<&'a str, u64>,
+    changes: Option<&'a crate::changes::ChangeSummaries>,
 }
 
 impl<'a> Ctx<'a> {
@@ -201,6 +204,7 @@ impl<'a> Ctx<'a> {
             v,
             comments,
             last_touch,
+            changes: None,
         }
     }
 
@@ -300,7 +304,16 @@ pub fn show(ui: &mut Ui, v: &View, filter: &mut BoardFilter, out: &mut Intents) 
         return;
     }
 
-    let ctx = Ctx::new(v);
+    let mut ctx = Ctx::new(v);
+    let ids: Vec<String> = v
+        .state
+        .tasks
+        .iter()
+        .filter(|t| !t.archived && t.status != Status::Pending)
+        .map(|t| t.id.clone())
+        .collect();
+    filter.changes.poll(ui.ctx(), ids);
+    ctx.changes = Some(&filter.changes);
     let cols = collect(&ctx, filter);
     let visible = visible_columns(filter);
     if visible.is_empty() {
@@ -768,6 +781,7 @@ fn card(ui: &mut Ui, ctx: &Ctx, col: Col, t: &Task, manual: bool, out: &mut Inte
     let blocked = t.status == Status::Blocked;
     let width = ui.available_width().max(1.0);
     let bg = ui.painter().add(Shape::Noop);
+    let mut badge_rect: Option<Rect> = None;
 
     let frame = egui::Frame::new()
         .inner_margin(Margin::symmetric(10, 8))
@@ -848,6 +862,9 @@ fn card(ui: &mut Ui, ctx: &Ctx, col: Col, t: &Task, manual: bool, out: &mut Inte
                     }
                 });
             }
+            if let Some(sum) = ctx.changes.and_then(|c| c.get(&t.id)) {
+                badge_rect = Some(change_badge(ui, v, sum));
+            }
             if blocked {
                 let dep = t.blocked_by.first().and_then(|id| state.task(id));
                 let text = match dep {
@@ -898,6 +915,14 @@ fn card(ui: &mut Ui, ctx: &Ctx, col: Col, t: &Task, manual: bool, out: &mut Inte
         Sense::click()
     };
     let resp = ui.interact(rect, ui.scope_id().with(("card", &t.id)), sense);
+    let mut badge_clicked = false;
+    if let Some(br) = badge_rect {
+        let b = ui.interact(br, ui.scope_id().with(("changes", &t.id)), Sense::click());
+        badge_clicked = b
+            .on_hover_text(v.tr.t("team.taskDetail.changes.reviewTaskDiff"))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked();
+    }
     let dragging_any = egui::DragAndDrop::has_any_payload(ui.ctx());
     if manual && resp.drag_started() {
         egui::DragAndDrop::set_payload(
@@ -933,6 +958,10 @@ fn card(ui: &mut Ui, ctx: &Ctx, col: Col, t: &Task, manual: bool, out: &mut Inte
     );
 
     let mut acted = false;
+    if badge_clicked {
+        acted = true;
+        out.push(Intent::OpenTask(t.id.clone()));
+    }
     if hovered {
         if let Some(_actor) = v.actor {
             let acts = quick_actions(t.status, &t.id, t.review_started);
@@ -991,6 +1020,30 @@ fn card(ui: &mut Ui, ctx: &Ctx, col: Col, t: &Task, manual: bool, out: &mut Inte
         });
     }
     rect
+}
+
+/// "3 files +40 -12" under the card header; returns its rect so the card can make it clickable.
+fn change_badge(ui: &mut Ui, v: &View, s: crate::changes::Summary) -> Rect {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(
+            RichText::new(v.tr.t_count("team.taskDetail.changes.fileCount", s.files as u64))
+                .size(10.5)
+                .color(theme::TEXT_2),
+        );
+        ui.label(
+            RichText::new(format!("+{}", s.added))
+                .size(10.5)
+                .color(theme::SUCCESS),
+        );
+        ui.label(
+            RichText::new(format!("-{}", s.removed))
+                .size(10.5)
+                .color(theme::ERROR),
+        );
+    })
+    .response
+    .rect
 }
 
 /// Small floating copy of the card's subject that follows the pointer while dragging.
@@ -1266,6 +1319,38 @@ mod tests {
         filter.layout = Layout::Grid;
         render(|ui| show(ui, &view, &mut filter, &mut intents));
         assert!(intents.0.is_empty());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn card_shows_change_badge_and_click_opens_task() {
+        let (home, data) = fixture("board-badge");
+        let view = View {
+            state: data.state(),
+            data: &data,
+            actor: Some("boss"),
+            agents: &[],
+            tr: crate::view::testing::tr(),
+        };
+        let mut filter = BoardFilter::default();
+        let ids: Vec<String> = view.state.tasks.iter().map(|t| t.id.clone()).collect();
+        let sum = crate::changes::Summary {
+            files: 3,
+            added: 40,
+            removed: 12,
+        };
+        for id in &ids {
+            filter.changes.seed(id, sum);
+        }
+        let mut intents = Intents::default();
+        let mut rect = None;
+        render(|ui| {
+            show(ui, &view, &mut filter, &mut intents);
+            rect = Some(change_badge(ui, &view, sum));
+        });
+        assert!(rect.unwrap().width() > 20.0);
+        assert_eq!(filter.changes.get(&ids[0]), Some(sum));
+        assert!(filter.changes.get("nope").is_none());
         let _ = std::fs::remove_dir_all(home);
     }
 }

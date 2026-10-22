@@ -548,6 +548,10 @@ mod tests {
             runtime: None,
             worktree: false,
             icon: None,
+            effort: None,
+            fast: false,
+            context_limit: None,
+            mcp_allow: vec![],
         }
     }
 
@@ -568,6 +572,7 @@ mod tests {
             attachments: vec![],
             related: vec![],
             review_started: false,
+            reviewers: vec![],
         }
     }
 
@@ -585,6 +590,7 @@ mod tests {
             deleted: false,
             column_order: Default::default(),
             schedules: vec![],
+            group_chats: vec![],
         });
         s.tasks = vec![
             task("1", Some("ada"), Status::InProgress, &[]),
@@ -649,6 +655,8 @@ mod tests {
                     text: "x".into(),
                     mode: None,
                     from_team: None,
+                    attachments: vec![],
+                    chat: None,
                 },
             ),
             ev(
@@ -658,6 +666,7 @@ mod tests {
                 EventKind::TaskCommented {
                     task: "1".into(),
                     text: "y".into(),
+                    attachments: vec![],
                 },
             ),
             ev(
@@ -669,6 +678,8 @@ mod tests {
                     text: "all".into(),
                     mode: None,
                     from_team: None,
+                    attachments: vec![],
+                    chat: None,
                 },
             ),
             ev(

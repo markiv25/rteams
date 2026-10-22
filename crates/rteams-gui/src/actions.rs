@@ -79,6 +79,27 @@ pub enum GuiCmd {
         text: String,
         mode: Option<String>,
     },
+    /// Message with attachments and/or into a user-created group chat (`chat` = its id).
+    MessageRich {
+        to: Option<String>,
+        chat: Option<String>,
+        text: String,
+        mode: Option<String>,
+        attachments: Vec<rteams_core::Attachment>,
+    },
+    GroupChatCreate {
+        id: String,
+        name: String,
+        members: Vec<String>,
+    },
+    GroupChatUpdate {
+        id: String,
+        name: Option<String>,
+        members: Option<Vec<String>>,
+    },
+    GroupChatDelete {
+        id: String,
+    },
     /// A message delivered into THIS team from a member of another team (`from_team`).
     CrossTeamMessage {
         to: Option<String>,
@@ -100,6 +121,14 @@ pub enum GuiCmd {
         /// Avatar icon; `Some("")` resets it to the default.
         icon: Option<String>,
     },
+    /// A member's saved launch settings (`None` = unchanged): effort (`Some("")` clears),
+    /// fast mode, and context limit (`Some(0)` clears).
+    SetMemberLaunch {
+        name: String,
+        effort: Option<String>,
+        fast: Option<bool>,
+        context_limit: Option<u32>,
+    },
     /// Remove (`removed: true`) or restore a member; history is kept.
     RemoveMember {
         name: String,
@@ -111,6 +140,11 @@ pub enum GuiCmd {
         name: String,
         runtime: Option<String>,
         worktree: Option<bool>,
+    },
+    /// Extra MCP server names the member's agent may use (`mcp_allow`; replaces the list).
+    SetMemberMcp {
+        name: String,
+        allow: Vec<String>,
     },
     /// `question: None` clears the "waiting for answer" flag.
     SetClarification {
@@ -134,6 +168,10 @@ pub enum GuiCmd {
     SetColumnOrder {
         column: String,
         order: Vec<String>,
+    },
+    /// Change the display name (the directory stays the team id).
+    RenameTeam {
+        name: String,
     },
     DeleteTeam {
         deleted: bool,
@@ -166,6 +204,10 @@ pub enum GuiCmd {
     CreateTaskFromMessage {
         message_seq: u64,
         owner: Option<String>,
+    },
+    /// Kill a registered process (the original's "kill process") and mark it stopped.
+    KillProcess {
+        pid: u32,
     },
 }
 
@@ -256,6 +298,26 @@ impl GuiCmd {
                 "message_send",
                 json!({ "actor": actor, "to": to, "text": text, "mode": mode }),
             ),
+            MessageRich {
+                to,
+                chat,
+                text,
+                mode,
+                attachments,
+            } => (
+                "message_send",
+                json!({ "actor": actor, "to": to, "chat": chat, "text": text, "mode": mode,
+                        "attachments": attachments }),
+            ),
+            GroupChatCreate { id, name, members } => (
+                "group_chat_create",
+                json!({ "actor": actor, "id": id, "name": name, "members": members }),
+            ),
+            GroupChatUpdate { id, name, members } => (
+                "group_chat_update",
+                json!({ "actor": actor, "id": id, "name": name, "members": members }),
+            ),
+            GroupChatDelete { id } => ("group_chat_delete", json!({ "actor": actor, "id": id })),
             CrossTeamMessage {
                 to,
                 text,
@@ -283,6 +345,16 @@ impl GuiCmd {
                 json!({ "actor": actor, "name": name, "role": role, "prompt": prompt,
                         "model": model, "icon": icon }),
             ),
+            SetMemberLaunch {
+                name,
+                effort,
+                fast,
+                context_limit,
+            } => (
+                "member_update",
+                json!({ "actor": actor, "name": name, "effort": effort, "fast": fast,
+                        "context_limit": context_limit }),
+            ),
             RemoveMember { name, removed } => (
                 "member_remove",
                 json!({ "actor": actor, "name": name, "removed": removed }),
@@ -295,6 +367,10 @@ impl GuiCmd {
                 "member_update",
                 json!({ "actor": actor, "name": name, "runtime": runtime,
                         "worktree": worktree }),
+            ),
+            SetMemberMcp { name, allow } => (
+                "member_update",
+                json!({ "actor": actor, "name": name, "mcp_allow": allow }),
             ),
             SetClarification { task, question } => (
                 "task_set_clarification",
@@ -317,6 +393,7 @@ impl GuiCmd {
                 "kanban_set_order",
                 json!({ "actor": actor, "column": column, "order": order }),
             ),
+            RenameTeam { name } => ("team_update", json!({ "actor": actor, "name": name })),
             DeleteTeam { deleted } => {
                 ("team_delete", json!({ "actor": actor, "deleted": deleted }))
             }
@@ -348,6 +425,7 @@ impl GuiCmd {
                 "task_create_from_message",
                 json!({ "actor": actor, "message_seq": message_seq, "owner": owner }),
             ),
+            KillProcess { pid } => ("process_unregister", json!({ "actor": actor, "pid": pid })),
         }
     }
 
@@ -403,6 +481,15 @@ impl GuiCmd {
                 tr.t_args("rteams.done.messageTo", &[("t", &t.to_string())])
             }
             Message { to: None, .. } => tr.t("rteams.done.broadcast"),
+            MessageRich { to: Some(t), .. } => {
+                tr.t_args("rteams.done.messageTo", &[("t", &t.to_string())])
+            }
+            MessageRich { to: None, .. } => tr.t("rteams.done.broadcast"),
+            GroupChatCreate { name, .. } => {
+                tr.t_args("rteams.done.groupCreate", &[("name", &name.to_string())])
+            }
+            GroupChatUpdate { .. } => tr.t("rteams.done.groupUpdate"),
+            GroupChatDelete { .. } => tr.t("rteams.done.groupDelete"),
             UpdateTask { task, .. } => {
                 tr.t_args("rteams.done.updateTask", &[("task", &task.to_string())])
             }
@@ -423,6 +510,12 @@ impl GuiCmd {
             } => tr.t_args("rteams.done.removeMember", &[("name", &name.to_string())]),
             RemoveMember { name, .. } => {
                 tr.t_args("rteams.done.restoreMember", &[("name", &name.to_string())])
+            }
+            SetMemberMcp { name, .. } => {
+                tr.t_args("rteams.done.updateMember", &[("name", &name.to_string())])
+            }
+            SetMemberLaunch { name, .. } => {
+                tr.t_args("rteams.done.updateMember", &[("name", &name.to_string())])
             }
             SetMemberRuntime { name, .. } => {
                 tr.t_args("rteams.done.memberRuntime", &[("name", &name.to_string())])
@@ -466,6 +559,7 @@ impl GuiCmd {
             SetColumnOrder { column, .. } => {
                 tr.t_args("rteams.done.reorder", &[("column", &column.to_string())])
             }
+            RenameTeam { .. } => tr.t("rteams.done.renameTeam"),
             DeleteTeam { deleted: true } => tr.t("rteams.done.deleteTeam"),
             DeleteTeam { .. } => tr.t("rteams.done.restoreTeam"),
             React { emoji, .. } => tr.t_args("rteams.done.react", &[("emoji", &emoji.to_string())]),
@@ -478,6 +572,7 @@ impl GuiCmd {
             DecidePermission { allow: true, .. } => tr.t("rteams.done.allow"),
             DecidePermission { .. } => tr.t("rteams.done.deny"),
             CreateTaskFromMessage { .. } => tr.t("rteams.done.fromMessage"),
+            KillProcess { pid } => format!("Killed process {pid}"),
         }
     }
 }
@@ -506,11 +601,45 @@ impl Commander {
             self.server = Some(Server::with_store(store));
         }
         let (name, args) = cmd.to_call(actor);
-        self.server
-            .as_ref()
-            .expect("opened above")
-            .call_tool(name, args)
-            .map_err(|e| e.to_string())
+        let server = self.server.as_ref().expect("opened above");
+        if let GuiCmd::KillProcess { pid } = cmd {
+            // Only a process an agent registered as running in this team is ever signalled.
+            let list = server
+                .call_tool("process_list", json!({}))
+                .map_err(|e| e.to_string())?;
+            let live = list["processes"]
+                .as_array()
+                .is_some_and(|ps| ps.iter().any(|p| p["pid"] == *pid && p["running"] == true));
+            if !live {
+                return Err(format!("process {pid} is not a running registered process"));
+            }
+            let out = server.call_tool(name, args).map_err(|e| e.to_string())?;
+            kill_pid(*pid)?;
+            return Ok(out);
+        }
+        server.call_tool(name, args).map_err(|e| e.to_string())
+    }
+}
+
+/// Ask the OS to terminate `pid` (SIGTERM; `taskkill /T` on Windows). Refuses pid 0 and 1.
+pub fn kill_pid(pid: u32) -> Result<(), String> {
+    if pid <= 1 {
+        return Err("refusing to signal pid 0/1".to_string());
+    }
+    #[cfg(unix)]
+    let out = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output();
+    #[cfg(windows)]
+    let out = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        // Already gone counts as killed: the registry entry is what matters.
+        Ok(o) if String::from_utf8_lossy(&o.stderr).contains("No such process") => Ok(()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -523,6 +652,44 @@ mod tests {
         let p = std::env::temp_dir().join(format!("rteams-gui-act-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_signals_only_registered_running_pids() {
+        let home = tmp("kill");
+        let mut c = Commander::new(home.clone(), "t".into());
+        c.run(
+            "boss",
+            &GuiCmd::CreateTeam {
+                name: "t".into(),
+                members: vec![("ada".into(), "dev".into())],
+            },
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Not registered: refused, and the child lives on.
+        assert!(c.run("boss", &GuiCmd::KillProcess { pid }).is_err());
+        assert!(child.try_wait().unwrap().is_none());
+        c.server
+            .as_ref()
+            .unwrap()
+            .call_tool(
+                "process_register",
+                json!({ "actor": "ada", "pid": pid, "label": "sleeper" }),
+            )
+            .unwrap();
+        c.run("boss", &GuiCmd::KillProcess { pid }).unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        let d = Data::open(home.clone(), "t").unwrap();
+        assert!(d.state().processes.iter().all(|p| !p.running));
+        assert!(kill_pid(1).is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

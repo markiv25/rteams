@@ -1,19 +1,23 @@
 //! news_dialog: "What's new" list of announcements, and an article view rendered as markdown.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use eframe::egui::{self, RichText};
 
 use super::close_guard::tx;
 use super::editor::md_preview;
 use crate::theme;
-use rteams_services::announcements::{policy, Model};
+use rteams_services::announcements::{assets, policy, Model};
 use rteams_services::i18n::I18n;
 
 #[derive(Default)]
 pub struct NewsDialog {
     open: bool,
     selected: Option<String>,
+    /// Cover bytes read from the on-disk cache (None = not cached yet / unreadable).
+    covers: HashMap<String, Option<Arc<[u8]>>>,
 }
 
 fn date(ms: i64) -> String {
@@ -65,6 +69,7 @@ impl NewsDialog {
         let mut close = false;
         let mut open_url = None;
         let mut read_now: Option<String> = None;
+        let mut dismiss_now: Option<String> = None;
         let modal = egui::Modal::new(egui::Id::unique("news_dialog"))
             .backdrop_color(egui::Color32::from_black_alpha(150))
             .frame(
@@ -111,6 +116,24 @@ impl NewsDialog {
                     {
                         self.selected = None;
                     }
+                    if let Some(u) = &a.cover_url {
+                        let bytes = self
+                            .covers
+                            .entry(u.clone())
+                            .or_insert_with(|| {
+                                assets::cached_cover(home, u)
+                                    .and_then(|p| std::fs::read(p).ok())
+                                    .map(Arc::from)
+                            })
+                            .clone();
+                        if let Some(b) = bytes {
+                            ui.add(
+                                egui::Image::from_bytes(format!("bytes://news-cover-{}", a.id), b)
+                                    .max_height(180.0)
+                                    .corner_radius(6.0),
+                            );
+                        }
+                    }
                     ui.label(RichText::new(&a.title).size(16.0).strong());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(date(a.published_at)).color(theme::MUTED));
@@ -129,11 +152,18 @@ impl NewsDialog {
                             },
                         );
                     });
-                    if let Some(u) = &a.url {
-                        if ui.link(u).clicked() {
-                            open_url = Some(u.clone());
+                    ui.horizontal(|ui| {
+                        if let Some(u) = &a.url {
+                            if ui.link(u).clicked() {
+                                open_url = Some(u.clone());
+                            }
                         }
-                    }
+                        if theme::ghost(ui, &tx(tr, "common.announcements.dismiss", "Dismiss"))
+                            .clicked()
+                        {
+                            dismiss_now = Some(a.id.clone());
+                        }
+                    });
                 } else if items.is_empty() {
                     ui.add_space(12.0);
                     if loading {
@@ -194,6 +224,10 @@ impl NewsDialog {
                 model.mark_read(home, &id);
             }
         }
+        if let Some(id) = dismiss_now {
+            model.dismiss(home, &id);
+            self.selected = None;
+        }
         if close || modal.should_close() {
             self.open = false;
             self.selected = None;
@@ -249,6 +283,8 @@ mod tests {
             d.show(ui.ctx(), &tr, &mut m, home.path(), 1000, "1.0.0", false);
         });
         assert!(m.state.is_read("a"), "viewing an article marks it read");
+        m.dismiss(home.path(), "a");
+        assert!(m.listed(1000, "1.0.0").is_empty() && m.state.is_dismissed("a"));
         let mut empty = Model::default();
         d.open();
         crate::view::testing::render(|ui| {
